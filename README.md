@@ -1,7 +1,7 @@
 # Capstone_Up_Body_App
 
 
-# FitQuest AI
+# Capstone_Up_Body_App
 
 > 인바디·헬스케어 데이터 기반 AI 운동 미션 생성 및 게임화 챌린지 애플리케이션
 
