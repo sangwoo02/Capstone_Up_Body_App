@@ -1,0 +1,382 @@
+@import url('https://cdn.jsdelivr.net/gh/orioncactus/pretendard/dist/web/static/pretendard.css');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* 업! 바디 - 게임 + 헬스케어 테마 */
+    --background: 220 25% 97%;
+    --foreground: 220 25% 10%;
+
+    --card: 0 0% 100%;
+    --card-foreground: 220 25% 10%;
+
+    --popover: 0 0% 100%;
+    --popover-foreground: 220 25% 10%;
+
+    /* Primary: 에너지틱 블루-바이올렛 */
+    --primary: 250 84% 60%;
+    --primary-foreground: 0 0% 100%;
+
+    /* Secondary: 소프트 그레이 */
+    --secondary: 220 20% 94%;
+    --secondary-foreground: 220 25% 25%;
+
+    --muted: 220 20% 94%;
+    --muted-foreground: 220 15% 50%;
+
+    /* Accent: 소프트 퍼플 (호버/포커스용) */
+    --accent: 250 60% 95%;
+    --accent-foreground: 250 84% 50%;
+
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 0 0% 100%;
+
+    --border: 220 18% 90%;
+    --input: 220 18% 90%;
+    --ring: 250 84% 60%;
+
+    --radius: 1rem;
+
+    /* Custom Game-Healthcare Colors */
+    --success: 145 80% 45%;
+    --success-foreground: 0 0% 100%;
+    --warning: 45 100% 55%;
+    --warning-foreground: 220 25% 10%;
+    --info: 200 95% 55%;
+    --info-foreground: 0 0% 100%;
+    --xp: 45 100% 50%;
+    --xp-foreground: 220 25% 10%;
+    --level: 280 75% 55%;
+    --level-foreground: 0 0% 100%;
+    --active: 290 70% 65%;
+    --active-foreground: 0 0% 100%;
+
+    /* Gradient Colors - 게임 느낌 */
+    --gradient-start: 250 84% 60%;
+    --gradient-end: 280 75% 55%;
+    --gradient-warm-start: 145 80% 50%;
+    --gradient-warm-end: 170 85% 45%;
+    --gradient-energy: 45 100% 55%;
+    --gradient-energy-end: 25 95% 55%;
+
+    /* Locked/Disabled State */
+    --locked: 220 15% 75%;
+    --locked-foreground: 220 15% 45%;
+
+    /* Navigation */
+    --nav-background: 0 0% 100%;
+    --nav-active: 250 84% 60%;
+    --nav-inactive: 220 15% 60%;
+
+    --sidebar-background: 0 0% 98%;
+    --sidebar-foreground: 240 5.3% 26.1%;
+    --sidebar-primary: 240 5.9% 10%;
+    --sidebar-primary-foreground: 0 0% 98%;
+    --sidebar-accent: 240 4.8% 95.9%;
+    --sidebar-accent-foreground: 240 5.9% 10%;
+    --sidebar-border: 220 13% 91%;
+    --sidebar-ring: 217.2 91.2% 59.8%;
+  }
+
+  .dark {
+    --background: 220 25% 6%;
+    --foreground: 0 0% 98%;
+
+    --card: 220 25% 10%;
+    --card-foreground: 0 0% 98%;
+
+    --popover: 220 25% 10%;
+    --popover-foreground: 0 0% 98%;
+
+    --primary: 250 84% 65%;
+    --primary-foreground: 0 0% 100%;
+
+    --secondary: 220 25% 15%;
+    --secondary-foreground: 0 0% 90%;
+
+    --muted: 220 25% 15%;
+    --muted-foreground: 220 15% 60%;
+
+    --accent: 250 50% 25%;
+    --accent-foreground: 250 84% 85%;
+
+    --destructive: 0 62% 45%;
+    --destructive-foreground: 0 0% 98%;
+
+    --border: 220 25% 18%;
+    --input: 220 25% 18%;
+    --ring: 250 84% 65%;
+
+    --success: 145 80% 50%;
+    --warning: 45 100% 55%;
+    --info: 200 95% 55%;
+    --xp: 45 100% 55%;
+    --level: 280 75% 60%;
+    --active: 290 70% 70%;
+
+    --locked: 220 20% 28%;
+    --locked-foreground: 220 15% 50%;
+
+    --nav-background: 220 25% 8%;
+    --nav-active: 250 84% 65%;
+    --nav-inactive: 220 15% 50%;
+
+    --sidebar-background: 240 5.9% 10%;
+    --sidebar-foreground: 240 4.8% 95.9%;
+    --sidebar-primary: 224.3 76.3% 48%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 240 3.7% 15.9%;
+    --sidebar-accent-foreground: 240 4.8% 95.9%;
+    --sidebar-border: 240 3.7% 15.9%;
+    --sidebar-ring: 217.2 91.2% 59.8%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  html, body, #root {
+    @apply h-full;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+    font-family: 'Pretendard', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+  }
+
+  /* Mobile App Container */
+  #root {
+    @apply max-w-[430px] mx-auto relative;
+    min-height: 100%;
+    box-shadow: 0 0 50px -10px hsl(250 84% 60% / 0.15);
+  }
+
+  @media (min-width: 430px) {
+    body {
+      @apply bg-muted;
+    }
+  }
+}
+
+@layer utilities {
+  .gradient-primary {
+    background: linear-gradient(135deg, hsl(var(--gradient-start)) 0%, hsl(var(--gradient-end)) 100%);
+  }
+
+  .gradient-warm {
+    background: linear-gradient(135deg, hsl(var(--gradient-warm-start)) 0%, hsl(var(--gradient-warm-end)) 100%);
+  }
+
+  .gradient-energy {
+    background: linear-gradient(135deg, hsl(var(--gradient-energy)) 0%, hsl(var(--gradient-energy-end)) 100%);
+  }
+
+  .gradient-subtle {
+    background: linear-gradient(180deg, hsl(var(--background)) 0%, hsl(var(--primary) / 0.08) 100%);
+  }
+
+  .gradient-game {
+    background: linear-gradient(135deg, hsl(250 84% 60%) 0%, hsl(280 75% 55%) 50%, hsl(145 80% 50%) 100%);
+  }
+
+  .text-gradient {
+    background: linear-gradient(135deg, hsl(var(--gradient-start)) 0%, hsl(var(--gradient-end)) 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+
+  .text-gradient-energy {
+    background: linear-gradient(135deg, hsl(var(--gradient-energy)) 0%, hsl(var(--gradient-energy-end)) 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+
+  .glass-card {
+    @apply bg-card/80 backdrop-blur-lg border border-border/50;
+  }
+
+  .card-shadow {
+    box-shadow: 0 2px 8px -2px rgba(0, 0, 0, 0.05), 
+                0 4px 16px -4px rgba(0, 0, 0, 0.08);
+  }
+
+  .card-shadow-lg {
+    box-shadow: 0 4px 12px -2px rgba(0, 0, 0, 0.08), 
+                0 8px 24px -4px rgba(0, 0, 0, 0.12);
+  }
+
+  .card-shadow-game {
+    box-shadow: 0 4px 20px -4px hsl(250 84% 60% / 0.25),
+                0 8px 30px -8px hsl(280 75% 55% / 0.2);
+  }
+
+  .glow-primary {
+    box-shadow: 0 0 20px hsl(250 84% 60% / 0.4),
+                0 0 40px hsl(250 84% 60% / 0.2);
+  }
+
+  .glow-accent {
+    box-shadow: 0 0 20px hsl(145 80% 50% / 0.4),
+                0 0 40px hsl(145 80% 50% / 0.2);
+  }
+
+  .safe-area-bottom {
+    padding-bottom: env(safe-area-inset-bottom, 20px);
+  }
+
+  .safe-area-top {
+    padding-top: env(safe-area-inset-top, 20px);
+  }
+}
+
+/* Custom Animations */
+@keyframes fade-in-up {
+  from {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes pulse-soft {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.7;
+  }
+}
+
+@keyframes shimmer {
+  0% {
+    background-position: -200% 0;
+  }
+  100% {
+    background-position: 200% 0;
+  }
+}
+
+@keyframes float {
+  0%, 100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-10px);
+  }
+}
+
+@keyframes pulse-glow {
+  0%, 100% {
+    box-shadow: 0 0 20px hsl(250 84% 60% / 0.3);
+  }
+  50% {
+    box-shadow: 0 0 40px hsl(250 84% 60% / 0.6), 0 0 60px hsl(145 80% 50% / 0.3);
+  }
+}
+
+@keyframes bounce-soft {
+  0%, 100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-5px);
+  }
+}
+
+@keyframes spin-slow {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes gradient-shift {
+  0%, 100% {
+    background-position: 0% 50%;
+  }
+  50% {
+    background-position: 100% 50%;
+  }
+}
+
+.animate-fade-in-up {
+  animation: fade-in-up 0.5s ease-out forwards;
+}
+
+.animate-pulse-soft {
+  animation: pulse-soft 2s ease-in-out infinite;
+}
+
+.animate-shimmer {
+  background: linear-gradient(
+    90deg,
+    hsl(var(--muted)) 25%,
+    hsl(var(--primary) / 0.3) 50%,
+    hsl(var(--muted)) 75%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.5s infinite;
+}
+
+.animate-float {
+  animation: float 3s ease-in-out infinite;
+}
+
+.animate-pulse-glow {
+  animation: pulse-glow 2s ease-in-out infinite;
+}
+
+.animate-bounce-soft {
+  animation: bounce-soft 1.5s ease-in-out infinite;
+}
+
+.animate-spin-slow {
+  animation: spin-slow 8s linear infinite;
+}
+
+.animate-gradient-shift {
+  background-size: 200% 200%;
+  animation: gradient-shift 3s ease infinite;
+}
+
+
+html,
+body,
+#root {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  scrollbar-width: none !important;
+  -ms-overflow-style: none !important;
+}
+
+html::-webkit-scrollbar,
+body::-webkit-scrollbar,
+#root::-webkit-scrollbar {
+  display: none !important;
+  width: 0 !important;
+  height: 0 !important;
+}
+
+.scrollbar-none {
+  scrollbar-width: none !important;
+  -ms-overflow-style: none !important;
+}
+
+.scrollbar-none::-webkit-scrollbar {
+  display: none !important;
+  width: 0 !important;
+  height: 0 !important;
+}
