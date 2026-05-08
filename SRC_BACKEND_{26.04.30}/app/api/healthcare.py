@@ -11,6 +11,11 @@ from app.core.deps import get_current_user
 from app.models.user import User, UserInbody, UserActivity, UserMission, UserWeightHistory
 from app.models.standard import HealthStandard
 from app.services.kosis_api import KosisHealthStatsService
+from app.services.activity_summary_service import (
+    build_activity_window_payload,
+    get_activity_records_for_range,
+    get_current_kst_week_range,
+)
 
 router = APIRouter(prefix="/healthcare", tags=["Healthcare"])
 logger = logging.getLogger(__name__)
@@ -368,6 +373,7 @@ class WeightHistoryItem(BaseModel):
 class HistoryResponse(BaseModel):
     activity_history: list[ActivityHistoryItem]
     weight_history: list[WeightHistoryItem]
+    activity_summary: Optional[Dict[str, Any]] = None
 
 
 # ---------- endpoints ----------
@@ -893,32 +899,21 @@ async def get_history(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    activity_query = (
-        db.query(UserActivity)
-        .filter(UserActivity.user_id == user.id)
-    )
-
     if week_start and week_end:
         try:
             start_date = datetime.strptime(week_start, "%Y-%m-%d").date()
             end_date = datetime.strptime(week_end, "%Y-%m-%d").date()
-
-            start_dt, end_dt = kst_date_range_to_utc_bounds(start_date, end_date)
-
-            activity_query = (
-                activity_query
-                .filter(UserActivity.recorded_at >= start_dt)
-                .filter(UserActivity.recorded_at <= end_dt)
-            )
         except ValueError:
             raise HTTPException(
                 status_code=400,
                 detail="날짜 형식이 올바르지 않습니다. YYYY-MM-DD 형식을 사용하세요."
             )
     else:
-        activity_query = activity_query.order_by(UserActivity.recorded_at.desc()).limit(7)
+        # HistoryPage 기본 화면과 AI 미션 생성이 같은 KST 월~일 7일 평균을 사용하도록 통일한다.
+        start_date, end_date = get_current_kst_week_range()
 
-    activities = activity_query.order_by(UserActivity.recorded_at.asc()).all()
+    activities = get_activity_records_for_range(db, user.id, start_date, end_date)
+    activity_window = build_activity_window_payload(activities, start_date, end_date)
 
     weights = (
         db.query(UserWeightHistory)
@@ -928,14 +923,8 @@ async def get_history(
         .all()
     )
 
-    activity_history = [
-        {
-            "date": to_kst(a.recorded_at).date().isoformat() if a.recorded_at else date.today().isoformat(),
-            "steps": int(a.steps or 0),
-            "calories": float(a.calories or 0),
-        }
-        for a in activities
-    ]
+    activity_history = activity_window["activity_history"]
+    activity_summary = activity_window["activity_summary"]
 
     weight_history = [
         {

@@ -7,6 +7,18 @@ from typing import Any, Dict, List, Optional
 import openai
 
 from app.core.config import settings
+from app.services.mission_policy.personalization_engine import build_personalization_policy
+from app.services.mission_policy.mission_contract import (
+    build_gpt_output_contract,
+    MISSION_OUTPUT_CONTRACT_VERSION,
+)
+from app.services.mission_policy.routine_catalog import (
+    adjust_routine_candidates_by_bias as adjust_catalog_routine_candidates_by_bias,
+    build_routine_candidates,
+    summarize_routine_catalog_for_prompt,
+)
+from app.services.mission_policy.checkin_catalog import summarize_checkin_catalog_for_prompt
+from app.services.mission_policy.numeric_target_policy import STEP_TARGET_MASTER, KCAL_TARGET_MASTER
 
 
 ALLOWED_TYPES_BY_SLOT = {
@@ -16,11 +28,19 @@ ALLOWED_TYPES_BY_SLOT = {
 }
 
 BEHAVIOR_HISTORY_WINDOW = 12
-STEP_TARGET_MASTER = [2500, 3000, 3500, 4000, 4500, 5000, 5500, 6000, 7000, 8000, 9000]
-KCAL_TARGET_MASTER = [80, 100, 120, 150, 180, 220, 250, 300]
 STRETCH_DURATION_MASTER = [5, 10, 15, 20, 25, 30]
 SLEEP_PREP_DURATION_MASTER = [10, 15, 20, 25, 30]
 CHECKIN_MIN_LENGTH_MASTER = [15, 20, 25]
+
+# GPT 생성 실험/로그 식별용 메타데이터.
+# PPT에서는 이 값으로 "정책 엔진 + strict system prompt ON/OFF" 실험군을 구분할 수 있다.
+# AI_MISSION_SYSTEM_PROMPT_ENABLED=false 로 실행하면 user payload/output_contract/개인화 정책은 유지하고
+# system role prompt만 제외되어 안정성 차이를 mission_generation_logs에 누적할 수 있다.
+MISSION_GPT_MODEL = "gpt-4.1"
+MISSION_GPT_PROMPT_VERSION = "mission_gpt_prompt_step6_2026_05_06"
+MISSION_GPT_EXPERIMENT_VARIANT = settings.AI_MISSION_EXPERIMENT_VARIANT
+SYSTEM_PROMPT_ENABLED = settings.AI_MISSION_SYSTEM_PROMPT_ENABLED
+MISSION_RESPONSE_SCHEMA_VERSION = "mission_response_schema_v2_reason_required_2026_05_06"
 
 
 class GPTMissionFormatError(ValueError):
@@ -89,37 +109,14 @@ def adjust_routine_candidates_by_bias(
     candidates: List[Dict[str, Any]],
     difficulty_bias: str,
 ) -> List[Dict[str, Any]]:
-    if difficulty_bias not in {"up", "down"}:
-        return candidates
+    """B3 루틴 후보 난이도 조정.
 
-    adjusted: List[Dict[str, Any]] = []
-    seen: set[tuple[Any, ...]] = set()
+    기존 missions.py가 이 함수를 import하고 있으므로 공개 이름은 유지하고,
+    실제 처리는 routine_catalog의 표준화 함수를 사용한다.
+    routine_key/routine_label/icon_key 같은 프론트 연결용 필드도 보존된다.
+    """
 
-    for candidate in candidates:
-        routine_name = str(candidate.get("routine_name") or "물 마시기").strip() or "물 마시기"
-        repeat_count = int(candidate.get("repeat_count", 3) or 3)
-        interval_min = int(candidate.get("interval_min", 10) or 10)
-
-        if difficulty_bias == "up":
-            repeat_count = min(repeat_count + 1, 5)
-            interval_min = max(interval_min - 5, 5)
-        else:
-            repeat_count = max(repeat_count - 1, 2)
-            interval_min = min(interval_min + 5, 15)
-
-        normalized = (routine_name, repeat_count, interval_min)
-        if normalized in seen:
-            continue
-        seen.add(normalized)
-        adjusted.append(
-            {
-                "routine_name": routine_name,
-                "repeat_count": repeat_count,
-                "interval_min": interval_min,
-            }
-        )
-
-    return adjusted or candidates
+    return adjust_catalog_routine_candidates_by_bias(candidates, difficulty_bias)
 
 
 def build_behavior_adaptation_summary_from_history(
@@ -253,6 +250,85 @@ def build_behavior_adaptation_summary_from_history(
 
 class GPTService:
     @staticmethod
+    def _build_response_json_schema(*, mission_count: int, slot_codes: List[str]) -> Dict[str, Any]:
+        """OpenAI JSON schema response_format에 전달할 최소 출력 스키마.
+
+        서버의 상세 검수는 missions.py에서 다시 수행한다. 여기서는 GPT가
+        reason 같은 필수 top-level mission field를 누락하지 않도록 응답 형태를
+        모델 단계에서 먼저 강하게 유도한다.
+        """
+
+        allowed_types: List[str] = []
+        for slot_code in slot_codes:
+            allowed_types.extend(ALLOWED_TYPES_BY_SLOT.get(slot_code, []))
+        allowed_types = _dedupe_preserve_order(allowed_types)
+
+        mission_schema: Dict[str, Any] = {
+            "type": "object",
+            "additionalProperties": True,
+            "required": [
+                "slot_code",
+                "title",
+                "description",
+                "mission_type",
+                "suggested_type",
+                "params",
+                "reason",
+            ],
+            "properties": {
+                "slot_code": {"type": "string", "enum": slot_codes or ["A", "B", "C"]},
+                "title": {"type": "string", "minLength": 1},
+                "description": {"type": "string", "minLength": 1},
+                "mission_type": {"type": "string", "enum": allowed_types or ["A1_STEP_TARGET", "A2_ACTIVE_KCAL_TARGET", "B1_TIMER_STRETCH", "B2_SLEEP_PREP", "B3_ROUTINE_CHECK", "C1_HEALTH_CHECKIN"]},
+                "suggested_type": {"type": "string", "enum": allowed_types or ["A1_STEP_TARGET", "A2_ACTIVE_KCAL_TARGET", "B1_TIMER_STRETCH", "B2_SLEEP_PREP", "B3_ROUTINE_CHECK", "C1_HEALTH_CHECKIN"]},
+                "params": {"type": "object", "additionalProperties": True},
+                "reason": {"type": "string", "minLength": 20},
+            },
+        }
+
+        return {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "ai_mission_generation_response",
+                "strict": False,
+                "schema": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["missions"],
+                    "properties": {
+                        "missions": {
+                            "type": "array",
+                            "minItems": mission_count,
+                            "maxItems": mission_count,
+                            "items": mission_schema,
+                        }
+                    },
+                },
+            },
+        }
+
+    @staticmethod
+    def _build_required_mission_templates(slot_codes: List[str]) -> List[Dict[str, Any]]:
+        """프롬프트 JSON 최상단에 넣는 필수 필드 템플릿.
+
+        System prompt ON/OFF 실험에서도 user prompt만 보고 출력 형태를 알 수 있게 한다.
+        """
+
+        templates: List[Dict[str, Any]] = []
+        for slot_code in slot_codes:
+            allowed = ALLOWED_TYPES_BY_SLOT.get(slot_code, [])
+            templates.append({
+                "slot_code": slot_code,
+                "title": "사용자에게 보여줄 미션 제목",
+                "description": "사용자에게 보여줄 미션 설명",
+                "mission_type": f"one_of: {allowed}",
+                "suggested_type": "mission_type과 반드시 같은 값",
+                "params": "mission_type별 필수 params 객체",
+                "reason": "필수. 선택한 mission_type과 params 수치를 왜 추천했는지 설명하는 사용자 표시용 문장",
+            })
+        return templates
+
+    @staticmethod
     def _extract_json_payload(raw_text: Any) -> Any:
         """
         GPT 응답에서 JSON payload만 안전하게 추출한다.
@@ -355,6 +431,12 @@ class GPTService:
             ):
                 missions = [payload]
 
+            elif all(
+                key in payload
+                for key in ["slot_code", "title", "description", "mission_type", "params"]
+            ):
+                missions = [payload]
+
         if not isinstance(missions, list):
             keys = list(payload.keys()) if isinstance(payload, dict) else type(payload).__name__
             raise GPTMissionFormatError(
@@ -434,7 +516,7 @@ class GPTService:
                         "B2_SLEEP_PREP",
                     ]
                     notes.append(
-                        "초기 B 슬롯은 수면 데이터가 없으면 B3_ROUTINE_CHECK를 먼저 검토하세요."
+                        "초기 B 슬롯은 별도 수면 측정값을 근거로 삼지 않고도 수행 가능한 B3_ROUTINE_CHECK를 먼저 검토하세요."
                     )
                 elif avg_sleep_minutes_7d < 420:
                     preferred_types_by_slot["B"] = [
@@ -546,26 +628,26 @@ class GPTService:
         avg_sleep_minutes_7d = int(activity_summary.get("avg_sleep_minutes_7d", 0) or 0)
 
         if avg_steps_7d <= 2000:
-            step_target_candidates = [2500, 3000, 3500]
+            step_target_candidates = [1000, 1500, 2000]
         elif avg_steps_7d <= 4000:
-            step_target_candidates = [3500, 4000, 4500]
+            step_target_candidates = [2000, 2500, 3000]
         elif avg_steps_7d <= 6000:
-            step_target_candidates = [4500, 5000, 5500]
+            step_target_candidates = [3000, 3500, 4000]
         elif avg_steps_7d <= 8000:
-            step_target_candidates = [5500, 6000, 7000]
+            step_target_candidates = [4000, 4500, 5000]
         else:
-            step_target_candidates = [7000, 8000, 9000]
+            step_target_candidates = [5500, 7000, 8000]
 
         if avg_active_kcal_7d <= 80:
-            kcal_target_candidates = [80, 100, 120]
+            kcal_target_candidates = [40, 60, 80]
         elif avg_active_kcal_7d <= 140:
-            kcal_target_candidates = [100, 120, 150]
+            kcal_target_candidates = [60, 80, 100]
         elif avg_active_kcal_7d <= 200:
-            kcal_target_candidates = [150, 180, 220]
+            kcal_target_candidates = [100, 120, 150]
         elif avg_active_kcal_7d <= 280:
-            kcal_target_candidates = [180, 220, 250]
+            kcal_target_candidates = [150, 180, 220]
         else:
-            kcal_target_candidates = [220, 250, 300]
+            kcal_target_candidates = [180, 220, 250]
 
         if comparison.get("activity_status") == "low":
             stretch_duration_candidates = [5, 10, 15]
@@ -579,11 +661,15 @@ class GPTService:
         else:
             sleep_prep_duration_candidates = [15, 20, 25]
 
-        routine_candidates = [
-            {"routine_name": "물 마시기", "repeat_count": 3, "interval_min": 10},
-            {"routine_name": "물 마시기", "repeat_count": 4, "interval_min": 10},
-            {"routine_name": "가볍게 일어나기", "repeat_count": 3, "interval_min": 15},
-        ]
+        routine_candidates = build_routine_candidates(
+            difficulty="easy" if comparison.get("activity_status") == "low" else "normal",
+            goal_direction=str((comparison or {}).get("goal_type") or "health_maintenance"),
+            activity_status=str((comparison or {}).get("activity_status") or "low"),
+            sleep_status="unknown",
+            data_confidence=str((comparison or {}).get("data_confidence") or "medium"),
+            difficulty_bias="neutral",
+            limit=6,
+        )
         checkin_min_length_candidates = [15, 20, 25]
 
         a_bias = str(_get_behavior_slot_summary(behavior_summary, "A").get("difficulty_bias") or "neutral")
@@ -641,7 +727,7 @@ class GPTService:
 5. 단일 슬롯 생성이어도 반드시 {"missions": [...]} 형태로 반환하세요.
 6. "mission" 단수 key를 쓰지 마세요.
 7. 최상위 배열만 반환하지 마세요.
-8. 모든 mission 객체에는 slot_code, title, description, suggested_type, params, reason을 포함하세요.
+8. 모든 mission 객체에는 slot_code, title, description, mission_type, suggested_type, params, reason을 포함하세요.
 9. params는 반드시 JSON 객체입니다.
 10. deadline, due_date, fail, failed, time_limit, expires_at 필드는 절대 넣지 마세요.
 
@@ -650,13 +736,14 @@ class GPTService:
   "missions": [
     {
       "slot_code": "A",
-      "title": "활동칼로리 80kcal 달성에 도전해보세요",
-      "description": "지금부터 80kcal를 더 쌓아보세요.",
+      "title": "활동칼로리 40kcal 달성에 도전해보세요",
+      "description": "지금부터 40kcal를 더 쌓아보세요.",
+      "mission_type": "A2_ACTIVE_KCAL_TARGET",
       "suggested_type": "A2_ACTIVE_KCAL_TARGET",
       "params": {
-        "target_kcal": 80
+        "target_kcal": 40
       },
-      "reason": "최근 활동량이 낮은 흐름을 반영해 가볍게 움직이며 실천할 수 있는 활동 미션으로 구성했어요."
+      "reason": "최근 활동량이 낮은 흐름을 반영해 40kcal 목표로 부담 없이 움직일 수 있게 구성했어요."
     }
   ]
 }
@@ -664,7 +751,10 @@ class GPTService:
 [핵심 규칙]
 1. 미션은 시스템이 판정 가능한 타입으로만 생성하세요.
 2. 실패 개념이 없는 미션만 생성하세요.
-3. 모든 mission 객체에는 반드시 reason 필드를 포함하세요.
+3. 모든 mission 객체에는 반드시 mission_type, suggested_type, reason 필드를 포함하세요.
+3-1. mission_type과 suggested_type은 반드시 같은 문자열이어야 합니다.
+3-2. mission_type은 slot_code별 허용 타입 목록 안에 있어야 합니다.
+3-3. params 값은 personalization_policy.target_candidates_by_slot 후보값을 최우선으로 사용하세요. output_contract.target_value_constraints는 기본 형식 참고용이며, A타입 숫자는 반드시 allowed_target_band_by_type이 우선입니다.
 4. reason은 입력된 사용자 데이터, 최근 활동 데이터, 공공데이터 비교 결과를 바탕으로 작성하세요.
 5. reason은 짧고 자연스러운 설명형 문장으로 작성하세요.
 6. reason은 의학적 진단처럼 단정하면 안 됩니다.
@@ -691,6 +781,29 @@ class GPTService:
 16. 체중/BMI 상태는 health_gap.bmi_basis 또는 comparison.weight_status_basis에 따른 BMI 기준 상태를 우선 사용하세요.
 17. 체지방률은 별도 의학 기준이 없는 한 public_average와의 차이를 참고값으로만 사용하고, 높다/위험하다처럼 단정하지 마세요.
 18. raw 데이터를 그대로 반복하지 말고 해석된 설명을 작성하세요.
+
+[개인화 정책 엔진 반영 규칙]
+1. user prompt의 personalization_policy는 FastAPI 서버가 계산한 최우선 개인화 정책입니다.
+2. personalization_policy.type_priority_by_slot의 앞쪽 타입을 우선 선택하세요.
+3. personalization_policy.discouraged_types_by_slot에 있는 타입은 가능한 피하세요. 단, C 슬롯은 C1_HEALTH_CHECKIN 하나만 허용되므로 C1 자체를 피하라는 뜻으로 해석하지 말고 checkin_key를 바꿔 다양화하세요.
+4. personalization_policy.difficulty_by_slot이 easy이면 낮은 target 후보와 짧은 루틴 후보를 선택하세요.
+5. personalization_policy.difficulty_by_slot이 normal이면 후보 범위 안에서 기본 수준의 target을 선택하세요.
+6. personalization_policy.target_candidates_by_slot에 있는 후보값을 먼저 사용하세요.
+6-1. A타입은 서버가 계산한 권장값과 허용 밴드를 함께 사용합니다. server_recommended_target_* 값을 가장 먼저 고려하되, allowed_target_band_by_type 안에서만 수치를 선택하세요.
+6-2. A1_STEP_TARGET은 allowed_target_band_by_type.A1_STEP_TARGET 안의 값만 params.target_steps에 넣을 수 있습니다.
+6-3. A2_ACTIVE_KCAL_TARGET은 allowed_target_band_by_type.A2_ACTIVE_KCAL_TARGET 안의 값만 params.target_kcal에 넣을 수 있습니다.
+6-4. A타입 title, description, reason의 숫자는 params에 선택한 숫자와 반드시 일치해야 합니다.
+7. target_recommendation_context는 personalization_policy를 납작하게 펼친 호환용 값입니다. 두 값이 다르게 보이면 personalization_policy를 우선하세요.
+8. reason은 personalization_policy.reason_basis_by_slot 또는 reason_basis의 근거를 자연스럽게 반영하세요.
+9. reason_basis 문장을 그대로 복사하지 말고 사용자에게 보여줄 자연스러운 문장으로 바꾸세요.
+10. reason에는 내부 필드명, policy_version, difficulty_by_slot, reason_basis 같은 개발자용 용어를 쓰지 마세요.
+11. 건강 유지 목표는 꾸준한 활동, 생활 루틴, 컨디션 기록 중심으로 설명하세요.
+12. 체중 감량 목표는 체중 수치 압박이 아니라 활동량을 자연스럽게 늘리는 방향으로 설명하세요.
+13. 데이터가 부족하다는 근거가 있으면 위험 판단이 아니라 가볍게 시작할 수 있다는 방향으로 설명하세요.
+14. 행동 이력 근거가 있으면 "최근 잘 이어온 흐름", "부담을 낮춰"처럼 부드럽게 표현하세요.
+15. personalization_policy에 없는 데이터를 새로 지어내지 마세요.
+16. B3_ROUTINE_CHECK를 선택할 때 personalization_policy.target_candidates_by_slot.B.routine_rotation.blocked_routine_keys가 있으면 해당 routine_key는 최근 사용된 루틴이므로 선택하지 마세요.
+17. B3_ROUTINE_CHECK는 personalization_policy.target_candidates_by_slot.B.routine_candidates의 앞쪽 후보를 우선 사용하고, 최근 B3 루틴과 다른 routine_key를 골라야 합니다.
 
 [사용자 목표 반영 규칙]
 1. user_profile.goal 값은 반드시 미션 난이도와 문장 방향에 참고하세요.
@@ -722,9 +835,10 @@ class GPTService:
 12. B1_TIMER_STRETCH reason에는 선택한 duration_min 값을 반드시 포함하고, 그 시간의 스트레칭 루틴으로 구성한 이유를 설명하세요.
 13. B2_SLEEP_PREP reason에는 선택한 duration_min 값을 반드시 포함하고, 그 시간의 수면 준비 루틴으로 구성한 이유를 설명하세요.
 14. B3_ROUTINE_CHECK reason에는 routine_name, repeat_count, interval_min 값을 자연스럽게 포함하고, 그 반복 루틴으로 구성한 이유를 설명하세요.
-15. C1_HEALTH_CHECKIN reason에는 선택한 min_length 값을 반드시 포함하되, 시간처럼 표현하지 말고 글자 수 기준으로 설명하세요.
+15. C1_HEALTH_CHECKIN reason에는 checkin_label 또는 prompt_label과 선택한 min_length 값을 반드시 포함하되, 시간처럼 표현하지 말고 글자 수 기준으로 설명하세요.
 16. A타입 미션의 reason은 사용자의 목표, 최근 활동 흐름, 선택한 수치를 연결해서 설명하세요.
 17. B타입 미션의 reason은 사용자의 목표를 직접적인 체중 변화보다 습관 형성, 컨디션 관리, 회복 루틴 방향으로 연결하세요.
+17-1. 앱은 수면 데이터를 핵심 수집값으로 쓰지 않으므로 B타입 reason에 "수면 데이터 부족", "수면 기록이 없어" 같은 표현을 쓰지 마세요. B2는 수면 데이터 분석 결과가 아니라 휴식/수면 전 준비 루틴입니다.
 18. C타입 미션의 reason은 사용자의 목표를 컨디션 점검, 상태 기록, 생활 패턴 돌아보기 방향으로 연결하세요.
 19. reason에는 "몇 kg 감량", "꼭 빼야 함", "위험", "비만", "실패하지 않으려면" 같은 압박적이거나 진단처럼 들리는 표현을 쓰지 마세요.
 20. reason에 "AI가 생성한 미션입니다" 같은 일반적인 문장은 쓰지 마세요.
@@ -758,10 +872,10 @@ class GPTService:
 4. 초기 B 슬롯은 B2_SLEEP_PREP도 정상적인 1순위 후보입니다.
 5. avg_active_kcal_7d가 낮거나 보통이면 A2_ACTIVE_KCAL_TARGET을 적극 검토하세요.
 6. avg_sleep_minutes_7d가 존재하고 낮으면 B2_SLEEP_PREP을 적극 검토하세요.
-7. avg_sleep_minutes_7d가 0이면 B2보다 B3_ROUTINE_CHECK를 먼저 고려하세요.
+7. avg_sleep_minutes_7d가 0이면 수면 데이터 부족을 이유로 쓰지 말고, B2보다 B3_ROUTINE_CHECK를 먼저 고려하세요.
 8. target_recommendation_context가 있으면 그 후보값 안에서 먼저 고르세요.
 9. 같은 사용자에게 반복 생성해도 5000, 150, 15 같은 기본값만 고정 반복하지 마세요.
-10. B3_ROUTINE_CHECK는 정상적인 B 슬롯 핵심 후보이며, 수면 데이터가 없을 때 특히 적극 검토하세요.
+10. B3_ROUTINE_CHECK는 정상적인 B 슬롯 핵심 후보이며, 별도 수면 측정값을 쓰지 않는 상황에서도 적극 검토하세요.
 11. behavior_adaptation.slots[slot].preferred_types 는 가중치 정보이며, 한 타입으로 고정하라는 뜻이 아닙니다.
 12. behavior_adaptation.slots[slot].discouraged_types 는 가능한 피하되 중복 방지와 슬롯 규칙을 더 우선하세요.
 13. behavior_adaptation.slots[slot].difficulty_bias 가 up이면 숫자/시간/반복 수를 후보 안에서 한 단계 높이고, down이면 한 단계 낮추세요.
@@ -779,17 +893,21 @@ class GPTService:
 [타입별 params 규칙]
 - A1_STEP_TARGET
   params = { "target_steps": 정수 }
-  권장 target_steps 후보 = [2500, 3000, 3500, 4000, 4500, 5000, 5500, 6000, 7000, 8000, 9000]
-  target_steps가 2500이면 A타입 기준 최소 걸음 미션입니다.
+  target_steps는 personalization_policy.target_candidates_by_slot.A.allowed_target_band_by_type.A1_STEP_TARGET 안의 값만 사용하세요. server_recommended_target_steps가 1순위 권장값입니다.
+  실제 허용 target_steps는 user prompt의 personalization_policy.target_candidates_by_slot.A.allowed_target_band_by_type.A1_STEP_TARGET 안의 값만 사용하세요.
+  예: allowed_target_band_by_type.A1_STEP_TARGET이 [1000, 1500]이면 1000 또는 1500만 사용할 수 있고, 2000 이상은 사용할 수 없습니다.
+  target_steps가 1000이면 A타입 기준 최소 걸음 미션입니다.
   이 경우 title 또는 description에 반드시 "최소"라는 단어를 포함하세요.
-  예: "최소 2500보 걷기에 도전해보세요"
+  예: "최소 1000보 걷기에 도전해보세요"
 
 - A2_ACTIVE_KCAL_TARGET
   params = { "target_kcal": 정수 }
-  권장 target_kcal 후보 = [80, 100, 120, 150, 180, 220, 250, 300]
-  target_kcal가 80이면 A타입 기준 최소 활동칼로리 미션입니다.
+  target_kcal는 personalization_policy.target_candidates_by_slot.A.allowed_target_band_by_type.A2_ACTIVE_KCAL_TARGET 안의 값만 사용하세요. server_recommended_target_kcal가 1순위 권장값입니다.
+  실제 허용 target_kcal는 user prompt의 personalization_policy.target_candidates_by_slot.A.allowed_target_band_by_type.A2_ACTIVE_KCAL_TARGET 안의 값만 사용하세요.
+  예: allowed_target_band_by_type.A2_ACTIVE_KCAL_TARGET이 [40, 60]이면 40 또는 60만 사용할 수 있고, 80 이상은 사용할 수 없습니다.
+  target_kcal가 40이면 A타입 기준 최소 활동칼로리 미션입니다.
   이 경우 title 또는 description에 반드시 "최소"라는 단어를 포함하세요.
-  예: "최소 활동칼로리 80kcal 달성에 도전해보세요"
+  예: "최소 활동칼로리 40kcal 달성에 도전해보세요"
 
 - B1_TIMER_STRETCH
   params = { "duration_min": 정수 }
@@ -801,23 +919,240 @@ class GPTService:
 
 - B3_ROUTINE_CHECK
   params = {
+    "routine_key": 문자열,
     "routine_name": 문자열,
+    "routine_label": 문자열,
+    "routine_category": 문자열,
+    "icon_key": 문자열,
+    "action_label": 문자열,
     "repeat_count": 정수,
     "interval_min": 정수
   }
+  routine_key, routine_name, routine_label, routine_category, icon_key, action_label은 personalization_policy.target_candidates_by_slot.B.routine_candidates 또는 routine_catalog.allowed_routines에 있는 값만 사용하세요.
+  routine_key와 routine_name은 반드시 서로 같은 카탈로그 항목이어야 합니다.
   권장 repeat_count 후보 = [2, 3, 4, 5]
   권장 interval_min 후보 = [5, 10, 15]
+  B3는 물 마시기만 반복하지 말고 routine_candidates의 다양한 routine_key를 우선 사용하세요.
+  personalization_policy.target_candidates_by_slot.B.routine_rotation.blocked_routine_keys에 포함된 routine_key는 최근 사용된 루틴이므로 선택하지 마세요.
 
 - C1_HEALTH_CHECKIN
-  params = { "min_length": 정수 }
+  params = {
+    "checkin_key": 문자열,
+    "checkin_label": 문자열,
+    "checkin_category": 문자열,
+    "icon_key": 문자열,
+    "prompt_label": 문자열,
+    "min_length": 정수
+  }
+  checkin_key, checkin_label, checkin_category, icon_key, prompt_label은 personalization_policy.target_candidates_by_slot.C.checkin_candidates 또는 checkin_catalog.allowed_checkins에 있는 값만 사용하세요.
+  checkin_key와 checkin_label은 반드시 서로 같은 카탈로그 항목이어야 합니다.
   권장 min_length 후보 = [15, 20, 25]
 
 [C1 문장 규칙]
 - C1_HEALTH_CHECKIN의 min_length는 글자 수입니다.
 - C1에는 시간 표현을 넣지 마세요.
 - description은 글자 수 기준으로 작성하세요.
+- 같은 C1 타입이 반복되더라도 checkin_key를 바꿔 오늘 컨디션, 활동 돌아보기, 수면 느낌, 기분과 에너지, 건강 습관 회고, 몸의 신호처럼 기록 주제를 다양화하세요.
 - 너무 추상적인 표현만 쓰지 말고, 사용자가 실제 상태와 행동을 함께 기록하게 유도하세요.
 """.strip()
+
+    @staticmethod
+    def _compact_generation_payload_for_prompt(payload: Dict[str, Any]) -> Dict[str, Any]:
+        """GPT 입력 토큰을 줄이기 위한 프롬프트 전용 compact payload.
+
+        mission_generation_logs에는 full trace를 남기되, GPT에는 실제 생성에 필요한 핵심 정책만 전달한다.
+        """
+
+        def pick(source: Optional[Dict[str, Any]], keys: List[str]) -> Dict[str, Any]:
+            source = source or {}
+            return {key: source.get(key) for key in keys if key in source and source.get(key) is not None}
+
+        slot_codes = list(payload.get("slot_codes") or [])
+        policy = payload.get("personalization_policy") or {}
+        target_by_slot = policy.get("target_candidates_by_slot") or {}
+
+        compact_targets: Dict[str, Any] = {}
+        for slot_code in slot_codes:
+            slot_target = target_by_slot.get(slot_code) or {}
+            if slot_code == "A":
+                compact_targets[slot_code] = pick(slot_target, [
+                    "difficulty",
+                    "selection_mode",
+                    "selected_targets",
+                    "recommended_targets",
+                    "server_recommended_target_steps",
+                    "server_recommended_target_kcal",
+                    "allowed_target_band_by_type",
+                    "step_target_candidates",
+                    "kcal_target_candidates",
+                    "basis",
+                ])
+            elif slot_code == "B":
+                compact_targets[slot_code] = pick(slot_target, [
+                    "difficulty",
+                    "stretch_duration_candidates",
+                    "sleep_prep_duration_candidates",
+                    "routine_candidates",
+                    "routine_rotation",
+                    "repeat_count_candidates",
+                    "interval_min_candidates",
+                    "basis",
+                ])
+            elif slot_code == "C":
+                compact_targets[slot_code] = pick(slot_target, [
+                    "difficulty",
+                    "checkin_min_length_candidates",
+                    "checkin_candidates",
+                    "basis",
+                ])
+
+        output_contract = payload.get("output_contract") or {}
+        compact_contract = pick(output_contract, [
+            "contract_version",
+            "required_top_level_key",
+            "required_mission_keys",
+            "type_alias_rule",
+            "slot_type_rule",
+            "a_type_hybrid_band_rule",
+            "reason_rule",
+        ])
+
+        # GPT가 master constraint(예: A2 40~300)와 개인화 밴드(예: A2 [40, 60])를
+        # 동시에 보고 80 같은 band 밖 값을 고르는 문제가 있었다.
+        # compact payload에서는 A타입 constraint를 서버 개인화 밴드로 덮어써서
+        # 모델이 볼 수 있는 숫자 후보 자체를 검수 기준과 일치시킨다.
+        target_constraints = dict(output_contract.get("target_value_constraints") or {})
+        a_target = compact_targets.get("A") or {}
+        band_by_type = a_target.get("allowed_target_band_by_type") or {}
+        if band_by_type.get("A1_STEP_TARGET"):
+            target_constraints["A1_STEP_TARGET"] = {"target_steps": band_by_type.get("A1_STEP_TARGET")}
+        if band_by_type.get("A2_ACTIVE_KCAL_TARGET"):
+            target_constraints["A2_ACTIVE_KCAL_TARGET"] = {"target_kcal": band_by_type.get("A2_ACTIVE_KCAL_TARGET")}
+        if target_constraints:
+            compact_contract["target_value_constraints"] = target_constraints
+            if band_by_type:
+                compact_contract["a_type_exact_allowed_band_by_type"] = band_by_type
+        if "B" in slot_codes and output_contract.get("b3_rule"):
+            compact_contract["b3_rule"] = pick(output_contract.get("b3_rule") or {}, [
+                "required_param_keys",
+                "routine_key_rule",
+                "routine_name_rule",
+            ])
+        if "C" in slot_codes and output_contract.get("c1_rule"):
+            compact_contract["c1_rule"] = pick(output_contract.get("c1_rule") or {}, [
+                "required_param_keys",
+                "checkin_key_rule",
+                "checkin_label_rule",
+            ])
+
+        behavior = payload.get("behavior_adaptation") or {}
+        compact_behavior_slots: Dict[str, Any] = {}
+        for slot_code in slot_codes:
+            slot_behavior = ((behavior.get("slots") or {}).get(slot_code) or {})
+            compact_behavior_slots[slot_code] = pick(slot_behavior, [
+                "confidence",
+                "refresh_rate",
+                "completion_rate",
+                "difficulty_bias",
+                "preferred_types",
+                "discouraged_types",
+                "preference_scores",
+                "routine_rotation",
+            ])
+
+        compact_policy = pick(policy, [
+            "policy_version",
+            "source",
+            "mode",
+            "slot_codes",
+            "goal_policy",
+            "difficulty_by_slot",
+            "effective_bias_by_slot",
+            "type_priority_by_slot",
+            "discouraged_types_by_slot",
+            "reason_basis_by_slot",
+            "reason_basis",
+            "notes",
+            "type_preference_context",
+        ])
+        compact_policy["target_candidates_by_slot"] = compact_targets
+
+        health_gap = payload.get("health_gap") or {}
+        comparison = payload.get("comparison") or {}
+
+        mission_count = int(payload.get("mission_count") or len(slot_codes) or 1)
+
+        return {
+            "generation_task": {
+                "instruction": "Generate AI missions as JSON only. The response must be exactly one object with a missions array.",
+                "mission_count": mission_count,
+                "slot_codes": slot_codes,
+                "schema_version": MISSION_RESPONSE_SCHEMA_VERSION,
+            },
+            "hard_output_contract": {
+                "top_level_key": "missions",
+                "missions_array_length": mission_count,
+                "each_mission_required_keys": [
+                    "slot_code",
+                    "title",
+                    "description",
+                    "mission_type",
+                    "suggested_type",
+                    "params",
+                    "reason",
+                ],
+                "reason_required_for_every_mission": True,
+                "missing_reason_is_invalid": True,
+                "mission_type_must_equal_suggested_type": True,
+            },
+            "required_mission_object_templates": GPTService._build_required_mission_templates(slot_codes),
+            "pre_submit_checklist": [
+                "Return JSON only, no markdown.",
+                "Check that missions length matches mission_count.",
+                "Check that every mission object includes reason.",
+                "Check that reason explains the selected params and does not repeat only the title.",
+                "Check that mission_type and suggested_type are identical.",
+                "For A1/A2, use only output_contract.a_type_exact_allowed_band_by_type or personalization_policy.target_candidates_by_slot.A.allowed_target_band_by_type.",
+            ],
+            "prompt_metadata": payload.get("prompt_metadata"),
+            "mode": payload.get("mode"),
+            "mission_count": mission_count,
+            "slot_codes": slot_codes,
+            "allowed_types_by_slot": payload.get("allowed_types_by_slot"),
+            "user_profile": pick(payload.get("user_profile"), [
+                "age", "gender", "height_cm", "weight_kg", "bmi", "body_fat", "target_weight", "goal",
+            ]),
+            "activity_summary": pick(payload.get("activity_summary"), [
+                "today_steps", "avg_steps_7d", "today_active_kcal", "avg_active_kcal_7d",
+                "sleep_minutes_latest", "avg_sleep_minutes_7d", "average_basis", "range_start", "range_end",
+            ]),
+            "comparison": pick(comparison, [
+                "goal_type", "goal_label", "bmi_status", "bmi_label_ko", "weight_status",
+                "activity_status", "step_status", "data_confidence", "avg_steps_7d", "avg_active_kcal_7d",
+            ]),
+            "public_average": pick(payload.get("public_average"), [
+                "source", "source_detail", "age_group", "gender", "avg_bmi", "avg_weight", "avg_body_fat",
+                "is_body_fat_estimated",
+            ]),
+            "health_gap": pick(health_gap, [
+                "goal_type", "goal_label", "bmi_status", "bmi_label_ko", "weight_status",
+                "activity_status", "step_status", "sleep_status", "data_confidence",
+                "weight_gap_kg", "body_fat_gap", "public_average_is_reference_only",
+                "activity_status_is_official_guideline",
+            ]),
+            "personalization_policy": compact_policy,
+            "output_contract": compact_contract,
+            "behavior_adaptation": {
+                "source": behavior.get("source"),
+                "confidence": behavior.get("confidence"),
+                "resolved_count": behavior.get("resolved_count"),
+                "slots": compact_behavior_slots,
+            },
+            "existing_missions": payload.get("existing_missions") or [],
+            "previous_mission": payload.get("previous_mission"),
+            "retry_attempt": payload.get("retry_attempt"),
+            "constraints": payload.get("constraints"),
+        }
 
     @staticmethod
     def _build_user_prompt(
@@ -834,49 +1169,79 @@ class GPTService:
         previous_mission: Optional[Dict[str, Any]] = None,
         retry_attempt: int = 1,
         behavior_summary: Optional[Dict[str, Any]] = None,
+        system_prompt_enabled: bool = SYSTEM_PROMPT_ENABLED,
     ) -> str:
-        type_preference_context = GPTService._build_type_preference_context(
+        payload = GPTService.build_generation_trace_context(
+            mode=mode,
+            mission_count=mission_count,
+            slot_codes=slot_codes,
+            user_profile=user_profile,
+            activity_summary=activity_summary,
+            comparison=comparison,
+            public_average=public_average,
+            health_gap=health_gap,
+            existing_missions=existing_missions,
+            previous_mission=previous_mission,
+            retry_attempt=retry_attempt,
+            behavior_summary=behavior_summary,
+            system_prompt_enabled=system_prompt_enabled,
+        )
+
+        compact_payload = GPTService._compact_generation_payload_for_prompt(payload)
+        return json.dumps(compact_payload, ensure_ascii=False)
+
+    @staticmethod
+    def build_generation_trace_context(
+        *,
+        mode: str,
+        mission_count: int,
+        slot_codes: List[str],
+        user_profile: Dict[str, Any],
+        activity_summary: Dict[str, Any],
+        comparison: Dict[str, Any],
+        public_average: Dict[str, Any],
+        health_gap: Dict[str, Any],
+        existing_missions: Optional[List[Dict[str, Any]]] = None,
+        previous_mission: Optional[Dict[str, Any]] = None,
+        retry_attempt: int = 1,
+        behavior_summary: Optional[Dict[str, Any]] = None,
+        system_prompt_enabled: bool = SYSTEM_PROMPT_ENABLED,
+    ) -> Dict[str, Any]:
+        """GPT user prompt와 실험 로그가 공유하는 단일 payload 생성 함수.
+
+        같은 입력으로 GPT에 전달되는 내용과 mission_generation_logs에 저장되는
+        정책/계약 정보를 맞추기 위해 프롬프트 payload 생성을 한 곳으로 모은다.
+        """
+
+        personalization_policy = build_personalization_policy(
             mode=mode,
             slot_codes=slot_codes,
+            user_profile=user_profile,
             activity_summary=activity_summary,
+            comparison=comparison,
+            health_gap=health_gap,
             existing_missions=existing_missions,
             previous_mission=previous_mission,
             retry_attempt=retry_attempt,
             behavior_summary=behavior_summary,
         )
 
-        target_recommendation_context = GPTService._build_target_recommendation_context(
-            activity_summary=activity_summary,
-            comparison=comparison,
-            behavior_summary=behavior_summary,
-        )
+        output_contract = build_gpt_output_contract(slot_codes)
 
-        payload = {
-            "output_contract": {
-                "top_level_type": "object",
-                "required_top_level_key": "missions",
-                "missions_type": "array",
-                "required_mission_keys": [
-                    "slot_code",
-                    "title",
-                    "description",
-                    "suggested_type",
-                    "params",
-                    "reason",
-                ],
-                "must_return_example_shape": {
-                    "missions": [
-                        {
-                            "slot_code": slot_codes[0] if slot_codes else "A",
-                            "title": "문자열",
-                            "description": "문자열",
-                            "suggested_type": "A1_STEP_TARGET",
-                            "params": {"target_steps": 2500},
-                            "reason": "문자열",
-                        }
-                    ]
-                },
+        # 기존 GPT 프롬프트 구조와의 호환을 위해 납작한 context도 함께 전달한다.
+        type_preference_context = personalization_policy.get("type_preference_context") or {}
+        target_recommendation_context = personalization_policy.get("target_recommendation_context") or {}
+
+        return {
+            "prompt_metadata": {
+                "prompt_version": MISSION_GPT_PROMPT_VERSION,
+                "model": MISSION_GPT_MODEL,
+                "experiment_variant": MISSION_GPT_EXPERIMENT_VARIANT,
+                "system_prompt_enabled": bool(system_prompt_enabled),
+                "policy_version": personalization_policy.get("policy_version"),
+                "contract_version": MISSION_OUTPUT_CONTRACT_VERSION,
             },
+            "output_contract": output_contract,
             "mode": mode,
             "mission_count": mission_count,
             "slot_codes": slot_codes,
@@ -885,6 +1250,9 @@ class GPTService:
             "comparison": comparison,
             "public_average": public_average,
             "health_gap": health_gap,
+            "personalization_policy": personalization_policy,
+            "routine_catalog": summarize_routine_catalog_for_prompt(),
+            "checkin_catalog": summarize_checkin_catalog_for_prompt(),
             "behavior_adaptation": behavior_summary or {},
             "existing_missions": existing_missions or [],
             "previous_mission": previous_mission,
@@ -900,10 +1268,17 @@ class GPTService:
                 "must_match_requested_slots": True,
                 "no_duplicate_types_in_response": True,
                 "no_failure_semantics": True,
+                "must_use_personalization_policy": True,
+                "must_use_reason_basis": True,
+                "must_include_mission_type_and_suggested_type": True,
+                "mission_type_must_equal_suggested_type": True,
+                "params_must_use_allowed_candidate_values": True,
+                "a_type_must_stay_inside_server_target_band": True,
+                "b3_params_must_match_routine_catalog": True,
+                "c1_params_must_match_checkin_catalog": True,
+                "contract_version": MISSION_OUTPUT_CONTRACT_VERSION,
             },
         }
-
-        return json.dumps(payload, ensure_ascii=False)
 
     @staticmethod
     async def generate_structured_missions(
@@ -920,6 +1295,7 @@ class GPTService:
         previous_mission: Optional[Dict[str, Any]] = None,
         retry_attempt: int = 1,
         behavior_summary: Optional[Dict[str, Any]] = None,
+        system_prompt_enabled: bool = SYSTEM_PROMPT_ENABLED,
     ) -> List[Dict[str, Any]]:
         """
         2단계용 구조화 미션 생성
@@ -931,31 +1307,38 @@ class GPTService:
 
         client = openai.AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
 
+        user_prompt = GPTService._build_user_prompt(
+            mode=mode,
+            mission_count=mission_count,
+            slot_codes=slot_codes,
+            user_profile=user_profile,
+            activity_summary=activity_summary,
+            comparison=comparison,
+            public_average=public_average,
+            health_gap=health_gap,
+            existing_missions=existing_missions,
+            previous_mission=previous_mission,
+            retry_attempt=retry_attempt,
+            behavior_summary=behavior_summary,
+            system_prompt_enabled=system_prompt_enabled,
+        )
+
+        messages = []
+        if system_prompt_enabled:
+            messages.append({"role": "system", "content": GPTService._build_system_prompt()})
+        messages.append({"role": "user", "content": user_prompt})
+
+        response_format = GPTService._build_response_json_schema(
+            mission_count=mission_count,
+            slot_codes=slot_codes,
+        )
+
         response = await client.chat.completions.create(
-            model="gpt-4.1",
-            messages=[
-                {"role": "system", "content": GPTService._build_system_prompt()},
-                {
-                    "role": "user",
-                    "content": GPTService._build_user_prompt(
-                        mode=mode,
-                        mission_count=mission_count,
-                        slot_codes=slot_codes,
-                        user_profile=user_profile,
-                        activity_summary=activity_summary,
-                        comparison=comparison,
-                        public_average=public_average,
-                        health_gap=health_gap,
-                        existing_missions=existing_missions,
-                        previous_mission=previous_mission,
-                        retry_attempt=retry_attempt,
-                        behavior_summary=behavior_summary,
-                    ),
-                },
-            ],
-            response_format={"type": "json_object"},
-            temperature=0.75 if mode in ["refresh", "retry", "complete_regen"] else 0.6,
-            max_tokens=900,
+            model=MISSION_GPT_MODEL,
+            messages=messages,
+            response_format=response_format,
+            temperature=0.65 if mode in ["refresh", "retry", "complete_regen"] else 0.45,
+            max_tokens=1200 if mission_count >= 3 else 750,
         )
 
         print("[GPT CHECK] connected to OpenAI successfully")

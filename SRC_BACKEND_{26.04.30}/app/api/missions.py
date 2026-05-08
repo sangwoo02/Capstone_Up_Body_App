@@ -1,10 +1,12 @@
 # app/api/missions.py
 
+import asyncio
 import re
 import json
-from typing import Any, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, status, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta, date
@@ -17,6 +19,9 @@ from app.services.health_logic import HealthAnalyzer
 from app.services.gpt_service import (
     GPTService,
     GPTMissionFormatError,
+    MISSION_GPT_EXPERIMENT_VARIANT,
+    MISSION_GPT_PROMPT_VERSION,
+    SYSTEM_PROMPT_ENABLED,
     ALLOWED_TYPES_BY_SLOT,
     BEHAVIOR_HISTORY_WINDOW,
     shift_numeric_candidates_by_bias,
@@ -28,12 +33,59 @@ from app.services.gpt_service import (
     CHECKIN_MIN_LENGTH_MASTER,
 )
 from app.services.mission_behavior_service import (
+    MISSION_EVENT_COMPLETED,
+    MISSION_EVENT_REFRESHED,
+    MISSION_EVENT_STARTED,
+    build_pending_event_history_item,
+    get_behavior_summary_with_pending_event,
     get_effective_behavior_summary,
+    log_mission_event,
     upsert_user_behavior_profile,
+)
+from app.services.mission_policy.health_gap_analyzer import (
+    build_health_gap_summary as build_policy_health_gap_summary,
+)
+from app.services.mission_policy.routine_catalog import (
+    ALLOWED_INTERVAL_MINUTES,
+    ALLOWED_REPEAT_COUNTS,
+    ROUTINE_CATALOG_VERSION,
+    build_routine_mission_payload,
+    build_routine_candidates,
+    get_allowed_routine_keys,
+    get_allowed_routine_names,
+    get_routine_by_key,
+    get_routine_by_name,
+    is_allowed_routine_name_for_key,
+    normalize_routine_key,
+    normalize_routine_params,
+)
+from app.services.mission_policy.checkin_catalog import (
+    CHECKIN_CATALOG_VERSION,
+    ALLOWED_CHECKIN_MIN_LENGTHS,
+    build_checkin_mission_payload,
+    build_checkin_candidates,
+    get_allowed_checkin_keys,
+    get_allowed_checkin_labels,
+    get_checkin_by_key,
+    is_allowed_checkin_label_for_key,
+    normalize_checkin_params,
+)
+from app.services.mission_policy.numeric_target_policy import build_a_selected_target_policy
+from app.services.mission_policy.mission_contract import (
+    MISSION_OUTPUT_CONTRACT_VERSION,
+    REQUIRED_MISSION_KEYS,
+    REQUIRED_B3_PARAM_KEYS,
+    REQUIRED_C1_PARAM_KEYS,
+    TARGET_VALUE_CONSTRAINTS,
 )
 from app.services.data_seeder import DataSeeder
 from app.models.standard import HealthStandard
 from app.services.kosis_api import KosisHealthStatsService
+from app.services.activity_summary_service import (
+    build_activity_summary_from_records,
+    get_activity_records_for_range,
+    get_current_kst_week_range,
+)
 from app.api.game import ensure_game_profile
 from app.api.auth import get_current_user_id
 from app.models.game import UserGameProfile
@@ -42,6 +94,50 @@ from app.services.achievement_service import evaluate_and_grant_achievements
 from app.models.game import UserOwnedCharacter
 
 router = APIRouter(prefix="/missions", tags=["Missions"])
+
+MissionProgressCallback = Callable[[Dict[str, Any]], Awaitable[None]]
+
+
+async def emit_generation_progress(
+    progress: Optional[MissionProgressCallback],
+    *,
+    stage: str,
+    label: str,
+    detail: str,
+    progress_percent: int,
+    step_index: int,
+    total_steps: int,
+    status_value: str = "running",
+    generation_id: Optional[str] = None,
+    meta: Optional[Dict[str, Any]] = None,
+) -> None:
+    """미션 생성 파이프라인의 실제 서버 처리 지점을 SSE 이벤트로 전달한다."""
+    if progress is None:
+        return
+
+    payload = {
+        "generation_id": generation_id,
+        "status": status_value,
+        "stage": stage,
+        "label": label,
+        "detail": detail,
+        "progress": max(0, min(100, int(progress_percent))),
+        "step_index": step_index,
+        "total_steps": total_steps,
+    }
+    if meta:
+        payload["meta"] = meta
+    await progress(payload)
+
+
+def format_sse_event(event_name: str, payload: Dict[str, Any]) -> str:
+    return f"event: {event_name}\ndata: {json.dumps(payload, ensure_ascii=False, default=str)}\n\n"
+
+
+INITIAL_GENERATION_TOTAL_STEPS = 10
+REFRESH_SLOT_TOTAL_STEPS = 8
+
+
 
 # 한국 성인 BMI 분류 기준: 정상 18.5~22.9, 비만전단계 23.0~24.9, 비만 25.0 이상.
 # 공공데이터 평균은 정상/위험 판정 기준이 아니라 참고 평균값으로만 사용한다.
@@ -265,50 +361,66 @@ def choose_candidate(candidates: List[int], previous_value: Optional[int] = None
 
 
 def build_step_target_mission_data(target_steps: int) -> Dict[str, Any]:
+    params = {"target_steps": target_steps}
     return {
         "slot_code": "A",
         "title": f"{target_steps}보 걷기에 도전해보세요",
         "description": f"지금부터 {target_steps}보를 더 걸어보세요.",
+        "mission_type": "A1_STEP_TARGET",
         "suggested_type": "A1_STEP_TARGET",
-        "params": {
-            "target_steps": target_steps,
-        },
+        "params": params,
+        "reason": generate_reason_fallback(
+            mission_type="A1_STEP_TARGET",
+            params=params,
+        ),
     }
 
 
 def build_active_kcal_mission_data(target_kcal: int) -> Dict[str, Any]:
+    params = {"target_kcal": target_kcal}
     return {
         "slot_code": "A",
         "title": f"활동칼로리 {target_kcal}kcal 달성에 도전해보세요",
         "description": f"지금부터 {target_kcal}kcal를 더 쌓아보세요.",
+        "mission_type": "A2_ACTIVE_KCAL_TARGET",
         "suggested_type": "A2_ACTIVE_KCAL_TARGET",
-        "params": {
-            "target_kcal": target_kcal,
-        },
+        "params": params,
+        "reason": generate_reason_fallback(
+            mission_type="A2_ACTIVE_KCAL_TARGET",
+            params=params,
+        ),
     }
 
 
 def build_stretch_mission_data(duration_min: int) -> Dict[str, Any]:
+    params = {"duration_min": duration_min}
     return {
         "slot_code": "B",
         "title": f"스트레칭 {duration_min}분을 완료해보세요",
         "description": f"가볍게 {duration_min}분 동안 몸을 풀어보세요.",
+        "mission_type": "B1_TIMER_STRETCH",
         "suggested_type": "B1_TIMER_STRETCH",
-        "params": {
-            "duration_min": duration_min,
-        },
+        "params": params,
+        "reason": generate_reason_fallback(
+            mission_type="B1_TIMER_STRETCH",
+            params=params,
+        ),
     }
 
 
 def build_sleep_prep_mission_data(duration_min: int) -> Dict[str, Any]:
+    params = {"duration_min": duration_min}
     return {
         "slot_code": "B",
         "title": f"편안한 휴식을 위한 {duration_min}분 루틴을 진행해보세요",
         "description": f"부담 없는 {duration_min}분 휴식 루틴으로 몸과 마음을 정리해보세요.",
+        "mission_type": "B2_SLEEP_PREP",
         "suggested_type": "B2_SLEEP_PREP",
-        "params": {
-            "duration_min": duration_min,
-        },
+        "params": params,
+        "reason": generate_reason_fallback(
+            mission_type="B2_SLEEP_PREP",
+            params=params,
+        ),
     }
 
 
@@ -316,17 +428,42 @@ def build_routine_check_mission_data(
     routine_name: str,
     repeat_count: int,
     interval_min: int,
+    routine_key: Optional[str] = None,
 ) -> Dict[str, Any]:
-    return {
-        "slot_code": "B",
-        "title": f"{routine_name} 루틴 {repeat_count}회 체크해보세요",
-        "description": f"{interval_min}분마다 {routine_name} 루틴을 체크해보세요.",
-        "suggested_type": "B3_ROUTINE_CHECK",
-        "params": {
+    """B3 루틴 체크 미션 데이터 생성.
+
+    기존 호출부 호환을 위해 routine_name 인자를 유지하되,
+    실제 params는 routine_catalog 기준으로 routine_key까지 포함해 표준화한다.
+    """
+
+    params = normalize_routine_params(
+        {
+            "routine_key": routine_key or normalize_routine_key(routine_name),
             "routine_name": routine_name,
             "repeat_count": repeat_count,
             "interval_min": interval_min,
-        },
+        }
+    )
+    routine = get_routine_by_key(params["routine_key"])
+
+    if routine:
+        title = routine["title_template"].format(**params)
+        description = routine["description_template"].format(**params)
+    else:
+        title = f"{params['routine_name']} 루틴 {params['repeat_count']}회 체크해보세요"
+        description = f"{params['interval_min']}분마다 {params['routine_name']} 루틴을 체크해보세요."
+
+    return {
+        "slot_code": "B",
+        "title": title,
+        "description": description,
+        "mission_type": "B3_ROUTINE_CHECK",
+        "suggested_type": "B3_ROUTINE_CHECK",
+        "params": params,
+        "reason": generate_reason_fallback(
+            mission_type="B3_ROUTINE_CHECK",
+            params=params,
+        ),
     }
 
 
@@ -334,15 +471,26 @@ def build_checkin_mission_data(
     title: str,
     description_template: str,
     min_length: int,
+    checkin_key: str = "condition_today",
 ) -> Dict[str, Any]:
+    """C1 fallback/호환용 미션 payload 생성.
+
+    기존 호출부 호환을 유지하되 params는 checkin_catalog 기준으로
+    checkin_key/checkin_label까지 포함한 표준 구조로 저장한다.
+    """
+
+    params = normalize_checkin_params({"checkin_key": checkin_key, "min_length": min_length})
     return {
         "slot_code": "C",
         "title": title,
-        "description": description_template.format(min_length=min_length),
+        "description": description_template.format(min_length=params["min_length"]),
+        "mission_type": "C1_HEALTH_CHECKIN",
         "suggested_type": "C1_HEALTH_CHECKIN",
-        "params": {
-            "min_length": min_length,
-        },
+        "params": params,
+        "reason": generate_reason_fallback(
+            mission_type="C1_HEALTH_CHECKIN",
+            params=params,
+        ),
     }
 
 
@@ -388,6 +536,28 @@ def is_generic_reason(reason: Optional[str]) -> bool:
     )
 
 
+
+
+def mentions_unavailable_sleep_data(reason: Optional[str]) -> bool:
+    """앱이 실제 수면 데이터를 수집하지 않는 상황에서 부자연스러운 수면 데이터 부족 표현을 감지한다."""
+    normalized = normalize_reason_text(reason)
+    if not normalized:
+        return False
+
+    sleep_terms = ["수면 데이터", "수면 기록", "수면 측정", "수면 정보"]
+    shortage_terms = ["부족", "없", "적", "누락"]
+    return any(term in normalized for term in sleep_terms) and any(term in normalized for term in shortage_terms)
+
+
+def has_sleep_activity_data(activity_summary: Optional[Dict[str, Any]]) -> bool:
+    activity_summary = activity_summary or {}
+    try:
+        latest = int(activity_summary.get("sleep_minutes_latest", 0) or 0)
+        avg = int(activity_summary.get("avg_sleep_minutes_7d", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    return latest > 0 or avg > 0
+
 def reason_matches_type(mission_type: str, reason: Optional[str]) -> bool:
     normalized = normalize_reason_text(reason)
     if not normalized:
@@ -399,7 +569,7 @@ def reason_matches_type(mission_type: str, reason: Optional[str]) -> bool:
         "B1_TIMER_STRETCH": ["스트레칭", "루틴", "몸을 풀", "실천"],
         "B2_SLEEP_PREP": ["휴식", "회복", "생활 패턴", "루틴"],
         "B3_ROUTINE_CHECK": ["반복", "습관", "루틴", "체크"],
-        "C1_HEALTH_CHECKIN": ["기록", "컨디션", "상태", "패턴"],
+        "C1_HEALTH_CHECKIN": ["기록", "컨디션", "상태", "패턴", "수면", "기분", "에너지", "활동", "회고", "몸"],
     }
 
     keywords = keyword_groups.get(mission_type, [])
@@ -477,13 +647,43 @@ def generate_reason_fallback(
         behavior_summary=behavior_summary,
     )
 
+    params = params or {}
+    b3_params = normalize_routine_params(params) if mission_type == "B3_ROUTINE_CHECK" else {}
+    c1_params = normalize_checkin_params(params) if mission_type == "C1_HEALTH_CHECKIN" else {}
+
+    target_steps = int(params.get("target_steps", 0) or 0)
+    target_kcal = int(params.get("target_kcal", 0) or 0)
+    duration_min = int(params.get("duration_min", 0) or 0)
+
     templates = {
-        "A1_STEP_TARGET": f"{prefix} 부담 없이 시작할 수 있는 걸음 미션으로 추천했어요.",
-        "A2_ACTIVE_KCAL_TARGET": f"{prefix} 가볍게 움직이며 실천할 수 있는 활동 미션으로 구성했어요.",
-        "B1_TIMER_STRETCH": f"{prefix} 가볍게 실천할 수 있는 스트레칭 루틴으로 추천했어요.",
-        "B2_SLEEP_PREP": f"{prefix} 꾸준히 이어가기 쉬운 휴식 루틴으로 조정했어요.",
-        "B3_ROUTINE_CHECK": f"{prefix} 작은 행동을 반복하며 습관을 만들 수 있는 체크형 루틴으로 구성했어요.",
-        "C1_HEALTH_CHECKIN": f"{prefix} 현재 상태를 직접 기록하며 건강 패턴을 돌아볼 수 있도록 기록형 미션을 추천했어요.",
+        "A1_STEP_TARGET": (
+            f"{prefix} {target_steps}보 목표로 부담 없이 걸음 루틴을 이어갈 수 있도록 추천했어요."
+            if target_steps
+            else f"{prefix} 부담 없이 시작할 수 있는 걸음 미션으로 추천했어요."
+        ),
+        "A2_ACTIVE_KCAL_TARGET": (
+            f"{prefix} {target_kcal}kcal 활동 목표로 가볍게 움직일 수 있게 구성했어요."
+            if target_kcal
+            else f"{prefix} 가볍게 움직이며 실천할 수 있는 활동 미션으로 구성했어요."
+        ),
+        "B1_TIMER_STRETCH": (
+            f"{prefix} {duration_min}분 스트레칭 루틴으로 몸을 풀며 이어가기 좋게 추천했어요."
+            if duration_min
+            else f"{prefix} 가볍게 실천할 수 있는 스트레칭 루틴으로 추천했어요."
+        ),
+        "B2_SLEEP_PREP": (
+            f"{prefix} {duration_min}분 휴식 루틴으로 몸과 마음을 정리하기 쉽게 조정했어요."
+            if duration_min
+            else f"{prefix} 꾸준히 이어가기 쉬운 휴식 루틴으로 조정했어요."
+        ),
+        "B3_ROUTINE_CHECK": (
+            f"{prefix} {b3_params.get('routine_name', '생활')} 루틴을 "
+            f"{b3_params.get('repeat_count', 3)}회 체크하며 습관으로 이어가기 좋게 구성했어요."
+        ),
+        "C1_HEALTH_CHECKIN": (
+            f"{prefix} {c1_params.get('checkin_label', '컨디션')} 주제로 현재 상태를 "
+            f"{c1_params.get('min_length', 15)}자 이상 기록하며 건강 패턴을 돌아볼 수 있도록 추천했어요."
+        ),
     }
 
     return templates.get(
@@ -511,6 +711,11 @@ def sanitize_mission_reason(
         or contains_forbidden_reason_phrase(reason)
         or not reason_matches_type(mission_type, reason)
         or is_generic_reason(reason)
+        or (
+            mission_type in {"B1_TIMER_STRETCH", "B2_SLEEP_PREP", "B3_ROUTINE_CHECK"}
+            and not has_sleep_activity_data(activity_summary)
+            and mentions_unavailable_sleep_data(reason)
+        )
     )
 
     if should_fallback:
@@ -524,6 +729,49 @@ def sanitize_mission_reason(
         )
 
     return reason
+
+
+def ensure_mission_reason_for_validation(
+    mission: Dict[str, Any],
+    *,
+    comparison: Optional[Dict[str, Any]] = None,
+    activity_summary: Optional[Dict[str, Any]] = None,
+    public_average: Optional[Dict[str, Any]] = None,
+    behavior_summary: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    GPT가 reason을 누락하거나 너무 일반적으로 작성했을 때 서버가 검수 가능한 reason을 합성한다.
+
+    목적:
+    - System Prompt 자연어 지시를 GPT가 일부 놓쳐도 전체 미션 생성을 실패시키지 않는다.
+    - 서버 구조화 데이터(params/type/activity_summary)를 기준으로 사용자 표시용 추천 이유를 보강한다.
+    - 원본 GPT 응답은 mission_generation_logs.raw_response_text에 남고, DB 저장 전 payload만 안전하게 정규화한다.
+    """
+
+    copied = dict(mission or {})
+    mission_type = str(
+        copied.get("suggested_type")
+        or copied.get("mission_type")
+        or ""
+    ).strip()
+    params = copied.get("params") or {}
+    original_reason = normalize_reason_text(copied.get("reason"))
+
+    copied["reason"] = sanitize_mission_reason(
+        raw_reason=original_reason,
+        mission_type=mission_type,
+        params=params,
+        comparison=comparison,
+        activity_summary=activity_summary,
+        public_average=public_average,
+        behavior_summary=behavior_summary,
+    )
+
+    if copied["reason"] != original_reason:
+        copied["server_reason_synthesized"] = True
+        copied["server_reason_synthesized_reason"] = "missing_or_invalid_gpt_reason"
+
+    return copied
 
 
 def normalize_user_goal_for_mission(goal: Optional[str]) -> str:
@@ -587,15 +835,15 @@ def get_recent_activity_records(
     user_id: int,
     days: int = 7,
 ) -> List[UserActivity]:
-    since = datetime.utcnow() - timedelta(days=max(days, 1))
+    """
+    AI 미션과 활동 히스토리의 평균 계산 기준을 통일한다.
 
-    return (
-        db.query(UserActivity)
-        .filter(UserActivity.user_id == user_id)
-        .filter(UserActivity.recorded_at >= since)
-        .order_by(UserActivity.recorded_at.desc(), UserActivity.id.desc())
-        .all()
-    )
+    기존에는 UTC rolling 7일 + 조회된 record 개수 평균이었고,
+    HistoryPage는 KST 월~일 7일 고정 평균이었다.
+    이제 미션 생성도 HistoryPage 기본 화면과 같은 KST 월~일 범위를 사용한다.
+    """
+    start_date, end_date = get_current_kst_week_range()
+    return get_activity_records_for_range(db, user_id, start_date, end_date)
 
 
 
@@ -603,39 +851,9 @@ def build_activity_summary(
     activity: Optional[UserActivity],
     recent_activities: Optional[List[UserActivity]] = None,
 ) -> Dict[str, Any]:
-    recent_activities = recent_activities or ([] if activity is None else [activity])
-    latest_activity = activity or (recent_activities[0] if recent_activities else None)
-
-    if not latest_activity and not recent_activities:
-        return {
-            "avg_steps_7d": 0,
-            "avg_active_kcal_7d": 0,
-            "today_steps": 0,
-            "today_active_kcal": 0,
-            "sleep_minutes_latest": 0,
-            "avg_sleep_minutes_7d": 0,
-        }
-
-    steps_samples = [int(a.steps or 0) for a in recent_activities]
-    kcal_samples = [int(a.calories or 0) for a in recent_activities]
-    sleep_samples = [
-        int(a.sleep_minutes or 0)
-        for a in recent_activities
-        if a.sleep_minutes is not None
-    ]
-
-    avg_steps_7d = round(sum(steps_samples) / len(steps_samples)) if steps_samples else 0
-    avg_active_kcal_7d = round(sum(kcal_samples) / len(kcal_samples)) if kcal_samples else 0
-    avg_sleep_minutes_7d = round(sum(sleep_samples) / len(sleep_samples)) if sleep_samples else 0
-
-    return {
-        "avg_steps_7d": avg_steps_7d,
-        "avg_active_kcal_7d": avg_active_kcal_7d,
-        "today_steps": int(latest_activity.steps or 0),
-        "today_active_kcal": int(latest_activity.calories or 0),
-        "sleep_minutes_latest": int(latest_activity.sleep_minutes or 0),
-        "avg_sleep_minutes_7d": avg_sleep_minutes_7d,
-    }
+    """Build the exact same summary shape/rule used by /healthcare/history."""
+    start_date, end_date = get_current_kst_week_range()
+    return build_activity_summary_from_records(recent_activities or [], start_date, end_date)
 
 
 def normalize_age_group(age: Optional[int]) -> Optional[int]:
@@ -752,118 +970,73 @@ def build_health_gap_summary(
     inbody: UserInbody,
     activity: Optional[UserActivity],
     public_average: Dict[str, Any],
+    activity_summary: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
-    GPT에게 전달할 건강 요약.
+    GPT에게 전달할 건강 격차 요약.
 
-    - 체중/BMI 상태는 한국 성인 BMI 기준으로 판단한다.
-    - 공공데이터 평균은 정상/위험 판정 기준이 아니라 참고 평균값으로만 제공한다.
-    - 체지방률은 현재 별도 의학 기준표가 없으므로 공공 평균과의 차이만 참고값으로 제공한다.
+    1차 고도화부터 실제 계산은 app.services.mission_policy.health_gap_analyzer로 분리한다.
+    이 wrapper는 기존 missions.py 호출부와의 호환성을 위한 얇은 연결 함수다.
     """
-
-    public_average = public_average or {}
-    avg_weight = public_average.get("avg_weight")
-    avg_bmi = public_average.get("avg_bmi")
-    avg_body_fat = public_average.get("avg_body_fat")
-
-    public_weight_gap_kg = None
-    public_bmi_gap = None
-    public_body_fat_gap = None
-
-    if inbody.weight is not None and avg_weight is not None:
-        public_weight_gap_kg = round(float(inbody.weight) - float(avg_weight), 1)
-
-    if inbody.bmi is not None and avg_bmi is not None:
-        public_bmi_gap = round(float(inbody.bmi) - float(avg_bmi), 1)
-
-    if inbody.body_fat is not None and avg_body_fat is not None:
-        public_body_fat_gap = round(float(inbody.body_fat) - float(avg_body_fat), 1)
-
-    bmi_status = get_bmi_status_for_mission(inbody.bmi)
-    weight_status = get_weight_status_by_bmi(inbody.bmi)
-    normal_weight_range = get_bmi_weight_range_for_mission(inbody.height)
-
-    # 기존 로그/프롬프트 호환성을 위해 key 이름은 유지하되, 값의 의미를 명확히 한다.
-    weight_gap_kg = None
-    if normal_weight_range and inbody.weight is not None:
-        weight = float(inbody.weight)
-        if weight < normal_weight_range["min"]:
-            weight_gap_kg = round(weight - normal_weight_range["min"], 1)
-        elif weight > normal_weight_range["max"]:
-            weight_gap_kg = round(weight - normal_weight_range["max"], 1)
-        else:
-            weight_gap_kg = 0.0
-
-    today_steps = activity.steps if activity and activity.steps else 0
-    today_kcal = int(activity.calories) if activity and activity.calories else 0
-
-    if today_steps >= 7000:
-        step_status = "good"
-    elif today_steps >= 4000:
-        step_status = "moderate"
-    else:
-        step_status = "below_average"
-
-    if today_kcal >= 300:
-        activity_status = "good"
-    elif today_kcal >= 150:
-        activity_status = "moderate"
-    else:
-        activity_status = "low"
-
-    return {
-        "weight_gap_kg": weight_gap_kg,
-        "bmi_gap": None,
-        "body_fat_gap": public_body_fat_gap,
-        "weight_status": weight_status,
-        "bmi_status": bmi_status,
-        "body_fat_status": "reference_only" if public_body_fat_gap is not None else "unknown",
-        "normal_weight_range": normal_weight_range,
-        "bmi_basis": "korean_adult_bmi_18.5_22.9",
-        "public_weight_gap_kg": public_weight_gap_kg,
-        "public_bmi_gap": public_bmi_gap,
-        "public_body_fat_gap": public_body_fat_gap,
-        "public_average_is_reference_only": True,
-        "step_status": step_status,
-        "activity_status": activity_status,
-        "public_data_source": public_average.get("source"),
-    }
-
+    return build_policy_health_gap_summary(
+        inbody=inbody,
+        activity=activity,
+        public_average=public_average,
+        activity_summary=activity_summary,
+    )
 
 def build_comparison_summary(
     inbody: UserInbody,
     activity: Optional[UserActivity],
     public_average: Optional[Dict[str, Any]] = None,
+    activity_summary: Optional[Dict[str, Any]] = None,
+    health_gap: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     미션 생성용 간단 비교 요약.
 
-    weight_status는 공공 평균 체중이 아니라 한국 성인 BMI 기준으로만 판단한다.
-    public_average는 별도 참고값으로 GPT payload에 전달된다.
+    1차 보정부터 comparison도 health_gap/activity_summary 기준으로 맞춘다.
+    - step_status/activity_status는 최신 하루값이 아니라 이번 주 7일 평균 기반 health_gap 값을 우선 사용한다.
+    - weight_status는 한국 성인 BMI 기준 health_gap 값을 우선 사용한다.
+    - public_average는 정상/위험 판정 기준이 아니라 참고 평균값으로만 둔다.
     """
 
-    step_status = "below_average"
-    activity_status = "low"
-    weight_status = get_weight_status_by_bmi(inbody.bmi)
+    activity_summary = activity_summary or {}
+    public_average = public_average or {}
 
-    today_steps = activity.steps if activity and activity.steps else 0
-    today_kcal = int(activity.calories) if activity and activity.calories else 0
+    if health_gap is None:
+        health_gap = build_health_gap_summary(
+            inbody=inbody,
+            activity=activity,
+            public_average=public_average,
+            activity_summary=activity_summary,
+        )
 
-    if today_steps >= 7000:
-        step_status = "good"
-    elif today_steps >= 4000:
-        step_status = "moderate"
-
-    if today_kcal >= 300:
-        activity_status = "good"
-    elif today_kcal >= 150:
-        activity_status = "moderate"
+    latest_steps = int(getattr(activity, "steps", 0) or 0) if activity else 0
+    latest_kcal = int(getattr(activity, "calories", 0) or 0) if activity else 0
 
     return {
-        "step_status": step_status,
-        "activity_status": activity_status,
-        "weight_status": weight_status,
-        "weight_status_basis": "korean_adult_bmi_18.5_22.9",
+        "step_status": health_gap.get("step_status", "below_average"),
+        "activity_status": health_gap.get("activity_status", "low"),
+        "weight_status": health_gap.get("weight_status", get_weight_status_by_bmi(inbody.bmi)),
+        "bmi_status": health_gap.get("bmi_status", "unknown"),
+        "bmi_category_detail": health_gap.get("bmi_category_detail", "unknown"),
+        "bmi_label_ko": health_gap.get("bmi_label_ko"),
+        "goal_type": health_gap.get("goal_type"),
+        "goal_label": health_gap.get("goal_label"),
+        "data_confidence": health_gap.get("data_confidence"),
+        "today_steps": int(activity_summary.get("today_steps", latest_steps) or 0),
+        "today_active_kcal": int(activity_summary.get("today_active_kcal", latest_kcal) or 0),
+        "avg_steps_7d": int(health_gap.get("avg_steps_7d", activity_summary.get("avg_steps_7d", 0)) or 0),
+        "avg_active_kcal_7d": int(
+            health_gap.get("avg_active_kcal_7d", activity_summary.get("avg_active_kcal_7d", 0)) or 0
+        ),
+        "weight_status_basis": health_gap.get("bmi_basis", "korean_adult_bmi_18.5_22.9"),
+        "activity_status_basis": health_gap.get("activity_status_basis"),
+        "activity_status_is_official_guideline": health_gap.get(
+            "activity_status_is_official_guideline", False
+        ),
+        "public_average_is_reference_only": health_gap.get("public_average_is_reference_only", True),
     }
 
 def infer_slot_code_from_type(suggested_type: Optional[str]) -> Optional[str]:
@@ -878,18 +1051,67 @@ def infer_slot_code_from_type(suggested_type: Optional[str]) -> Optional[str]:
     return None
 
 
+def normalize_generated_b3_params(params: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """GPT가 낸 B3 params를 카탈로그 기준으로 보강한다.
+
+    5차 계약부터는 GPT가 낸 repeat_count / interval_min을 조용히 보정하지 않는다.
+    routine_key 또는 routine_name이 카탈로그에 매칭될 때 프론트 연결용 필드만 채우고,
+    숫자 후보값 검수는 validate_params_by_type에서 엄격하게 처리한다.
+    """
+
+    params = dict(params or {})
+    routine_key = normalize_routine_key(params.get("routine_key"))
+    routine_from_name = get_routine_by_name(params.get("routine_name"))
+
+    if not routine_key and routine_from_name:
+        routine_key = str(routine_from_name["routine_key"])
+
+    routine = get_routine_by_key(routine_key) if routine_key else None
+    if not routine:
+        return params
+
+    return {
+        "routine_key": routine["routine_key"],
+        "routine_name": routine["routine_name"],
+        "routine_label": routine["routine_label"],
+        "routine_category": routine["routine_category"],
+        "icon_key": routine["icon_key"],
+        "action_label": routine["action_label"],
+        "repeat_count": params.get("repeat_count"),
+        "interval_min": params.get("interval_min"),
+        "catalog_version": params.get("catalog_version") or ROUTINE_CATALOG_VERSION,
+    }
+
+
 def normalize_generated_mission(mission: Dict[str, Any]) -> Dict[str, Any]:
     normalized = dict(mission or {})
 
+    raw_suggested_type = str(normalized.get("suggested_type") or "").strip()
+    raw_mission_type = str(normalized.get("mission_type") or "").strip()
+
+    if raw_suggested_type and raw_mission_type and raw_suggested_type != raw_mission_type:
+        normalized["_contract_error"] = (
+            f"mission_type과 suggested_type이 일치하지 않습니다: "
+            f"mission_type={raw_mission_type}, suggested_type={raw_suggested_type}"
+        )
+    elif raw_mission_type and not raw_suggested_type:
+        normalized["suggested_type"] = raw_mission_type
+    elif raw_suggested_type and not raw_mission_type:
+        normalized["mission_type"] = raw_suggested_type
+
     slot_code = normalized.get("slot_code")
-    suggested_type = normalized.get("suggested_type")
+    suggested_type = normalized.get("suggested_type") or normalized.get("mission_type")
 
     if slot_code is None or str(slot_code).strip() == "":
         inferred = infer_slot_code_from_type(suggested_type)
         if inferred:
             normalized["slot_code"] = inferred
 
+    if str(normalized.get("suggested_type") or "").strip() == "B3_ROUTINE_CHECK":
+        normalized["params"] = normalize_generated_b3_params(normalized.get("params") or {})
+
     return normalized
+
 
 def apply_a_type_minimum_label(mission_data: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -950,9 +1172,10 @@ def apply_a_type_minimum_label(mission_data: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def validate_mission_shape(mission: Dict[str, Any]) -> None:
-    required_keys = ["slot_code", "title", "description", "suggested_type", "params"]
+    if mission.get("_contract_error"):
+        raise ValueError(str(mission["_contract_error"]))
 
-    for key in required_keys:
+    for key in REQUIRED_MISSION_KEYS:
         if key not in mission:
             raise ValueError(f"GPT 미션 필드 누락: {key}")
         if mission[key] is None:
@@ -967,65 +1190,172 @@ def validate_mission_shape(mission: Dict[str, Any]) -> None:
     if not isinstance(mission["description"], str) or not mission["description"].strip():
         raise ValueError("description은 비어 있지 않은 문자열이어야 합니다.")
 
+    if not isinstance(mission["mission_type"], str) or not mission["mission_type"].strip():
+        raise ValueError("mission_type은 비어 있지 않은 문자열이어야 합니다.")
+
     if not isinstance(mission["suggested_type"], str) or not mission["suggested_type"].strip():
         raise ValueError("suggested_type은 비어 있지 않은 문자열이어야 합니다.")
+
+    if str(mission["mission_type"]).strip() != str(mission["suggested_type"]).strip():
+        raise ValueError("mission_type과 suggested_type은 반드시 같은 값이어야 합니다.")
 
     if not isinstance(mission["params"], dict):
         raise ValueError("params는 객체(JSON object)여야 합니다.")
 
-    if "reason" in mission and mission["reason"] is not None and not isinstance(mission["reason"], str):
-        raise ValueError("reason은 문자열이어야 합니다.")
+    if not isinstance(mission["reason"], str) or not mission["reason"].strip():
+        raise ValueError("reason은 비어 있지 않은 문자열이어야 합니다.")
 
 
-def validate_slot_and_type(slot_code: str, suggested_type: str) -> None:
+def validate_slot_and_type(slot_code: str, suggested_type: str, mission_type: Optional[str] = None) -> None:
     if slot_code not in ALLOWED_TYPES_BY_SLOT:
         raise ValueError(f"허용되지 않은 slot_code: {slot_code}")
 
-    if suggested_type not in ALLOWED_TYPES_BY_SLOT[slot_code]:
+    normalized_type = str(suggested_type or "").strip()
+    normalized_mission_type = str(mission_type or normalized_type).strip()
+
+    if normalized_type != normalized_mission_type:
         raise ValueError(
-            f"slot_code {slot_code} 에 suggested_type {suggested_type} 는 허용되지 않습니다."
+            f"mission_type과 suggested_type이 일치하지 않습니다: "
+            f"mission_type={normalized_mission_type}, suggested_type={normalized_type}"
+        )
+
+    if normalized_type not in ALLOWED_TYPES_BY_SLOT[slot_code]:
+        raise ValueError(
+            f"slot_code {slot_code} 에 mission_type {normalized_type} 는 허용되지 않습니다."
         )
 
 
-def validate_forbidden_text(title: str, description: str) -> None:
+def validate_forbidden_text(title: str, description: str, reason: Optional[str] = None) -> None:
     if contains_forbidden_phrase(title):
         raise ValueError(f"금지 문구가 title에 포함되어 있습니다: {title}")
     if contains_forbidden_phrase(description):
         raise ValueError(f"금지 문구가 description에 포함되어 있습니다: {description}")
+    if reason and contains_forbidden_reason_phrase(reason):
+        raise ValueError(f"금지 문구가 reason에 포함되어 있습니다: {reason}")
+
+
+def _validate_int_candidate(params: Dict[str, Any], key: str, allowed_values: List[int], mission_type: str) -> int:
+    value = params.get(key)
+    if not isinstance(value, int):
+        raise ValueError(f"{mission_type}은 params.{key}(int)가 필요합니다.")
+    if value not in allowed_values:
+        raise ValueError(f"{mission_type} params.{key}는 {allowed_values} 중 하나여야 합니다. actual={value}")
+    return value
+
+
+def validate_reason_contract(reason: str, suggested_type: str, params: Dict[str, Any]) -> None:
+    normalized = normalize_reason_text(reason)
+    if not normalized:
+        raise ValueError("reason은 비어 있지 않은 문자열이어야 합니다.")
+    if len(normalized) < REASON_MIN_LENGTH:
+        raise ValueError("reason이 너무 짧습니다.")
+    if len(normalized) > REASON_MAX_LENGTH:
+        raise ValueError("reason이 너무 깁니다.")
+    if contains_forbidden_reason_phrase(normalized):
+        raise ValueError(f"reason에 금지 문구가 포함되어 있습니다: {normalized}")
+    if is_generic_reason(normalized):
+        raise ValueError(f"reason이 너무 일반적입니다: {normalized}")
+    if not reason_matches_type(suggested_type, normalized):
+        raise ValueError(f"reason이 미션 타입과 충분히 연결되지 않습니다: {suggested_type}")
 
 
 def validate_params_by_type(suggested_type: str, params: Dict[str, Any]) -> None:
     if suggested_type == "A1_STEP_TARGET":
-        if not isinstance(params.get("target_steps"), int):
-            raise ValueError("A1_STEP_TARGET은 params.target_steps(int)가 필요합니다.")
+        _validate_int_candidate(
+            params,
+            "target_steps",
+            TARGET_VALUE_CONSTRAINTS["A1_STEP_TARGET"]["target_steps"],
+            suggested_type,
+        )
 
     elif suggested_type == "A2_ACTIVE_KCAL_TARGET":
-        if not isinstance(params.get("target_kcal"), int):
-            raise ValueError("A2_ACTIVE_KCAL_TARGET은 params.target_kcal(int)가 필요합니다.")
+        _validate_int_candidate(
+            params,
+            "target_kcal",
+            TARGET_VALUE_CONSTRAINTS["A2_ACTIVE_KCAL_TARGET"]["target_kcal"],
+            suggested_type,
+        )
 
     elif suggested_type == "B1_TIMER_STRETCH":
-        if not isinstance(params.get("duration_min"), int):
-            raise ValueError("B1_TIMER_STRETCH는 params.duration_min(int)이 필요합니다.")
+        _validate_int_candidate(
+            params,
+            "duration_min",
+            TARGET_VALUE_CONSTRAINTS["B1_TIMER_STRETCH"]["duration_min"],
+            suggested_type,
+        )
 
     elif suggested_type == "B2_SLEEP_PREP":
-        if not isinstance(params.get("duration_min"), int):
-            raise ValueError("B2_SLEEP_PREP는 params.duration_min(int)이 필요합니다.")
+        _validate_int_candidate(
+            params,
+            "duration_min",
+            TARGET_VALUE_CONSTRAINTS["B2_SLEEP_PREP"]["duration_min"],
+            suggested_type,
+        )
 
     elif suggested_type == "B3_ROUTINE_CHECK":
-        if not isinstance(params.get("routine_name"), str):
+        for key in REQUIRED_B3_PARAM_KEYS:
+            if key not in params or params.get(key) is None:
+                raise ValueError(f"B3_ROUTINE_CHECK는 params.{key} 값이 필요합니다.")
+
+        routine_key = str(params.get("routine_key") or "").strip()
+        routine_name = str(params.get("routine_name") or "").strip()
+
+        if routine_key not in get_allowed_routine_keys():
+            raise ValueError(f"B3_ROUTINE_CHECK routine_key가 허용 목록에 없습니다: {routine_key}")
+        if not isinstance(params.get("routine_name"), str) or not routine_name:
             raise ValueError("B3_ROUTINE_CHECK는 params.routine_name(str)이 필요합니다.")
-        if not isinstance(params.get("repeat_count"), int):
-            raise ValueError("B3_ROUTINE_CHECK는 params.repeat_count(int)가 필요합니다.")
-        if not isinstance(params.get("interval_min"), int):
-            raise ValueError("B3_ROUTINE_CHECK는 params.interval_min(int)가 필요합니다.")
+        if routine_name not in get_allowed_routine_names() and not is_allowed_routine_name_for_key(routine_key, routine_name):
+            raise ValueError(f"B3_ROUTINE_CHECK routine_name이 허용 목록에 없습니다: {routine_name}")
+        if not is_allowed_routine_name_for_key(routine_key, routine_name):
+            raise ValueError(f"B3_ROUTINE_CHECK routine_key와 routine_name이 일치하지 않습니다: {routine_key}/{routine_name}")
+
+        for key in ["routine_label", "routine_category", "icon_key", "action_label"]:
+            if not isinstance(params.get(key), str) or not str(params.get(key) or "").strip():
+                raise ValueError(f"B3_ROUTINE_CHECK는 params.{key}(str)가 필요합니다.")
+
+        _validate_int_candidate(
+            params,
+            "repeat_count",
+            TARGET_VALUE_CONSTRAINTS["B3_ROUTINE_CHECK"]["repeat_count"],
+            suggested_type,
+        )
+        _validate_int_candidate(
+            params,
+            "interval_min",
+            TARGET_VALUE_CONSTRAINTS["B3_ROUTINE_CHECK"]["interval_min"],
+            suggested_type,
+        )
 
     elif suggested_type == "C1_HEALTH_CHECKIN":
-        if not isinstance(params.get("min_length"), int):
-            raise ValueError("C1_HEALTH_CHECKIN은 params.min_length(int)가 필요합니다.")
+        for key in REQUIRED_C1_PARAM_KEYS:
+            if key not in params or params.get(key) is None:
+                raise ValueError(f"C1_HEALTH_CHECKIN은 params.{key} 값이 필요합니다.")
+
+        checkin_key = str(params.get("checkin_key") or "").strip()
+        checkin_label = str(params.get("checkin_label") or "").strip()
+
+        if checkin_key not in get_allowed_checkin_keys():
+            raise ValueError(f"C1_HEALTH_CHECKIN checkin_key가 허용 목록에 없습니다: {checkin_key}")
+        if not isinstance(params.get("checkin_label"), str) or not checkin_label:
+            raise ValueError("C1_HEALTH_CHECKIN은 params.checkin_label(str)이 필요합니다.")
+        if checkin_label not in get_allowed_checkin_labels() and not is_allowed_checkin_label_for_key(checkin_key, checkin_label):
+            raise ValueError(f"C1_HEALTH_CHECKIN checkin_label이 허용 목록에 없습니다: {checkin_label}")
+        if not is_allowed_checkin_label_for_key(checkin_key, checkin_label):
+            raise ValueError(f"C1_HEALTH_CHECKIN checkin_key와 checkin_label이 일치하지 않습니다: {checkin_key}/{checkin_label}")
+
+        for key in ["checkin_category", "icon_key", "prompt_label"]:
+            if not isinstance(params.get(key), str) or not str(params.get(key) or "").strip():
+                raise ValueError(f"C1_HEALTH_CHECKIN은 params.{key}(str)가 필요합니다.")
+
+        _validate_int_candidate(
+            params,
+            "min_length",
+            TARGET_VALUE_CONSTRAINTS["C1_HEALTH_CHECKIN"]["min_length"],
+            suggested_type,
+        )
 
     else:
         raise ValueError(f"알 수 없는 suggested_type: {suggested_type}")
-
 
 def validate_initial_missions(missions: List[Dict[str, Any]]) -> None:
     if len(missions) != 3:
@@ -1036,9 +1366,10 @@ def validate_initial_missions(missions: List[Dict[str, Any]]) -> None:
 
     for mission in missions:
         validate_mission_shape(mission)
-        validate_forbidden_text(mission["title"], mission["description"])
-        validate_slot_and_type(mission["slot_code"], mission["suggested_type"])
+        validate_forbidden_text(mission["title"], mission["description"], mission.get("reason"))
+        validate_slot_and_type(mission["slot_code"], mission["suggested_type"], mission.get("mission_type"))
         validate_params_by_type(mission["suggested_type"], mission["params"])
+        validate_reason_contract(mission["reason"], mission["suggested_type"], mission["params"])
 
         slot_codes.append(str(mission["slot_code"]).strip())
         suggested_types.append(mission["suggested_type"])
@@ -1052,9 +1383,10 @@ def validate_initial_missions(missions: List[Dict[str, Any]]) -> None:
 def validate_single_slot_mission(
     mission: Dict[str, Any],
     expected_slot_code: str,
+    personalization_policy: Optional[Dict[str, Any]] = None,
 ) -> None:
     validate_mission_shape(mission)
-    validate_forbidden_text(mission["title"], mission["description"])
+    validate_forbidden_text(mission["title"], mission["description"], mission.get("reason"))
 
     actual_slot_code = str(mission.get("slot_code") or "").strip()
     if actual_slot_code != expected_slot_code:
@@ -1062,13 +1394,191 @@ def validate_single_slot_mission(
             f"단일 슬롯 미션의 slot_code가 올바르지 않습니다. expected={expected_slot_code}, actual={actual_slot_code}"
         )
 
-    validate_slot_and_type(expected_slot_code, mission["suggested_type"])
+    validate_slot_and_type(expected_slot_code, mission["suggested_type"], mission.get("mission_type"))
     validate_params_by_type(mission["suggested_type"], mission["params"])
+    validate_a_type_uses_server_selected_target(mission, personalization_policy)
+    validate_b3_routine_rotation(mission, personalization_policy)
+    validate_reason_contract(mission["reason"], mission["suggested_type"], mission["params"])
+
+
+def get_allowed_a_target_band_from_policy(
+    personalization_policy: Optional[Dict[str, Any]],
+    mission_type: str,
+) -> List[int]:
+    """개인화 정책에서 A타입 허용 target band를 가져온다.
+
+    서버는 권장값을 계산하지만 GPT가 개인화 문맥에 따라 한 단계 주변 값을
+    고를 수 있도록 allowed_target_band 안의 값만 허용한다.
+    """
+
+    if not personalization_policy:
+        return []
+
+    a_targets = ((personalization_policy.get("target_candidates_by_slot") or {}).get("A") or {})
+    band_by_type = a_targets.get("allowed_target_band_by_type") or {}
+    raw_band = band_by_type.get(mission_type) or []
+
+    # 이전 서버 결정형 구조와의 호환: allowed_target_band_by_type이 없으면
+    # selected/recommended policy의 candidate_values를 허용 밴드로 사용한다.
+    if not raw_band:
+        selected = a_targets.get("recommended_targets") or a_targets.get("selected_targets") or {}
+        type_policy = selected.get(mission_type) or {}
+        raw_band = type_policy.get("allowed_target_band") or type_policy.get("candidate_values") or []
+
+    result: List[int] = []
+    for item in raw_band:
+        try:
+            value = int(item)
+        except (TypeError, ValueError):
+            continue
+        if value not in result:
+            result.append(value)
+    return result
+
+
+
+
+def get_recommended_a_target_from_policy(
+    personalization_policy: Optional[Dict[str, Any]],
+    mission_type: str,
+) -> Optional[int]:
+    """개인화 정책에서 A타입 서버 권장 target을 가져온다.
+
+    fallback/rebalance도 GPT 검수 기준과 동일한 숫자 밴드를 사용해야 하므로
+    target_candidates_by_slot.A 안의 recommended 값을 우선 사용한다.
+    """
+
+    if mission_type not in {"A1_STEP_TARGET", "A2_ACTIVE_KCAL_TARGET"}:
+        return None
+
+    a_targets = ((personalization_policy or {}).get("target_candidates_by_slot") or {}).get("A") or {}
+    metric_key = "target_steps" if mission_type == "A1_STEP_TARGET" else "target_kcal"
+    top_key = "server_recommended_target_steps" if mission_type == "A1_STEP_TARGET" else "server_recommended_target_kcal"
+
+    candidates = [
+        a_targets.get(top_key),
+        ((a_targets.get("recommended_targets") or {}).get(mission_type) or {}).get(metric_key),
+        ((a_targets.get("selected_targets") or {}).get(mission_type) or {}).get(metric_key),
+        ((a_targets.get("recommended_targets") or {}).get(mission_type) or {}).get("server_recommended_target"),
+        ((a_targets.get("selected_targets") or {}).get(mission_type) or {}).get("server_recommended_target"),
+    ]
+    for raw in candidates:
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+
+    band = get_allowed_a_target_band_from_policy(personalization_policy, mission_type)
+    return band[0] if band else None
+
+
+def build_a_target_values_for_fallback(
+    activity_summary: Dict[str, Any],
+    behavior_summary: Optional[Dict[str, Any]] = None,
+    personalization_policy: Optional[Dict[str, Any]] = None,
+    previous_mission: Optional[Dict[str, Any]] = None,
+) -> tuple[int, int]:
+    """A fallback/rebalance가 GPT 검수 기준과 같은 target을 쓰도록 통일한다."""
+
+    policy_steps = get_recommended_a_target_from_policy(personalization_policy, "A1_STEP_TARGET")
+    policy_kcal = get_recommended_a_target_from_policy(personalization_policy, "A2_ACTIVE_KCAL_TARGET")
+    if policy_steps and policy_kcal:
+        return int(policy_steps), int(policy_kcal)
+
+    avg_steps_7d = int((activity_summary or {}).get("avg_steps_7d", 0) or 0)
+    avg_active_kcal_7d = int((activity_summary or {}).get("avg_active_kcal_7d", 0) or 0)
+    difficulty_bias = str(get_slot_behavior_summary(behavior_summary, "A").get("difficulty_bias") or "neutral")
+    # 행동 이력이 부족해 neutral이어도 실제 활동 평균이 낮으면 easy로 계산한다.
+    low_activity = avg_steps_7d < 2500 or avg_active_kcal_7d < 80
+    effective_difficulty = "easy" if difficulty_bias == "down" or low_activity else "normal"
+    goal_direction = str((activity_summary or {}).get("goal_direction") or "health_maintenance")
+    a_policy = build_a_selected_target_policy(
+        activity_summary=activity_summary,
+        goal_direction=goal_direction,
+        difficulty=effective_difficulty,
+        difficulty_bias=difficulty_bias,
+        previous_mission=previous_mission,
+    )
+    return int(a_policy["A1_STEP_TARGET"]["target_steps"]), int(a_policy["A2_ACTIVE_KCAL_TARGET"]["target_kcal"])
+
+def validate_a_type_uses_server_target_band(
+    mission: Dict[str, Any],
+    personalization_policy: Optional[Dict[str, Any]],
+) -> None:
+    """A타입 GPT 출력이 서버가 계산한 허용 target band 안에 있는지 검수한다."""
+
+    mission_type = str(mission.get("suggested_type") or mission.get("mission_type") or "").strip()
+    if mission_type not in {"A1_STEP_TARGET", "A2_ACTIVE_KCAL_TARGET"}:
+        return
+
+    allowed_band = get_allowed_a_target_band_from_policy(personalization_policy, mission_type)
+    if not allowed_band:
+        return
+
+    params = mission.get("params") or {}
+    key = "target_steps" if mission_type == "A1_STEP_TARGET" else "target_kcal"
+    try:
+        actual = int(params.get(key))
+    except (TypeError, ValueError):
+        raise ValueError(f"{mission_type}은 서버 허용 밴드 안의 {key} 값을 사용해야 합니다. allowed={allowed_band}")
+
+    if actual not in allowed_band:
+        raise ValueError(
+            f"{mission_type} {key}는 서버 허용 밴드 안에서만 선택할 수 있습니다. allowed={allowed_band}, actual={actual}"
+        )
+
+
+# 이전 함수명 호환용 alias. 내부 동작은 exact selected가 아니라 target band 검수다.
+def validate_a_type_uses_server_selected_target(
+    mission: Dict[str, Any],
+    personalization_policy: Optional[Dict[str, Any]],
+) -> None:
+    validate_a_type_uses_server_target_band(mission, personalization_policy)
+
+
+def get_blocked_b3_routine_keys_from_policy(personalization_policy: Optional[Dict[str, Any]]) -> List[str]:
+    if not personalization_policy:
+        return []
+    b_targets = ((personalization_policy.get("target_candidates_by_slot") or {}).get("B") or {})
+    rotation = b_targets.get("routine_rotation") or {}
+    blocked = rotation.get("blocked_routine_keys") or []
+    result: List[str] = []
+    for item in blocked:
+        key = normalize_routine_key(item)
+        if key and key not in result:
+            result.append(key)
+    return result
+
+
+def validate_b3_routine_rotation(
+    mission: Dict[str, Any],
+    personalization_policy: Optional[Dict[str, Any]],
+) -> None:
+    """B3 루틴이 최근 사용한 routine_key를 반복하지 않는지 검수한다."""
+
+    mission_type = str(mission.get("suggested_type") or mission.get("mission_type") or "").strip()
+    if mission_type != "B3_ROUTINE_CHECK":
+        return
+
+    blocked_keys = get_blocked_b3_routine_keys_from_policy(personalization_policy)
+    if not blocked_keys:
+        return
+
+    params = mission.get("params") or {}
+    routine_key = normalize_routine_key(params.get("routine_key") or params.get("routine_name"))
+    if routine_key in blocked_keys:
+        raise ValueError(
+            f"B3_ROUTINE_CHECK routine_key가 최근 사용된 루틴과 반복됩니다: {routine_key}. blocked={blocked_keys}"
+        )
+
 
 def build_initial_slot_fallback_mission(
     slot_code: str,
     activity_summary: Dict[str, Any],
     behavior_summary: Optional[Dict[str, Any]] = None,
+    personalization_policy: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     avg_steps_7d = int(activity_summary.get("avg_steps_7d", 0) or 0)
     avg_active_kcal_7d = int(activity_summary.get("avg_active_kcal_7d", 0) or 0)
@@ -1079,35 +1589,16 @@ def build_initial_slot_fallback_mission(
     difficulty_bias = str(slot_behavior.get("difficulty_bias") or "neutral")
 
     if slot_code == "A":
-        if avg_steps_7d <= 2000:
-            step_candidates = [2500, 3000, 3500]
-        elif avg_steps_7d <= 4000:
-            step_candidates = [3500, 4000, 4500]
-        elif avg_steps_7d <= 6000:
-            step_candidates = [4500, 5000, 5500]
-        elif avg_steps_7d <= 8000:
-            step_candidates = [5500, 6000, 7000]
-        else:
-            step_candidates = [7000, 8000, 9000]
-
-        if avg_active_kcal_7d <= 80:
-            kcal_candidates = [80, 100, 120]
-        elif avg_active_kcal_7d <= 140:
-            kcal_candidates = [100, 120, 150]
-        elif avg_active_kcal_7d <= 200:
-            kcal_candidates = [150, 180, 220]
-        elif avg_active_kcal_7d <= 280:
-            kcal_candidates = [180, 220, 250]
-        else:
-            kcal_candidates = [220, 250, 300]
-
-        step_candidates = shift_numeric_candidates_by_bias(step_candidates, STEP_TARGET_MASTER, difficulty_bias)
-        kcal_candidates = shift_numeric_candidates_by_bias(kcal_candidates, KCAL_TARGET_MASTER, difficulty_bias)
+        selected_steps, selected_kcal = build_a_target_values_for_fallback(
+            activity_summary,
+            behavior_summary=behavior_summary,
+            personalization_policy=personalization_policy,
+        )
 
         if preferred_type == "A1_STEP_TARGET" and avg_active_kcal_7d > 120:
-            return build_step_target_mission_data(choose_candidate(step_candidates))
+            return build_step_target_mission_data(selected_steps)
 
-        return build_active_kcal_mission_data(choose_candidate(kcal_candidates))
+        return build_active_kcal_mission_data(selected_kcal)
 
     if slot_code == "B":
         stretch_candidates = [5, 10, 15] if avg_active_kcal_7d <= 150 else [10, 15, 20]
@@ -1148,72 +1639,23 @@ def rebalance_initial_missions(
     missions: List[Dict[str, Any]],
     activity_summary: Dict[str, Any],
     behavior_summary: Optional[Dict[str, Any]] = None,
+    personalization_policy: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """
     초기 3개 미션 타입 균형 보정.
 
-    주의:
-    - GPT가 만든 미션을 무조건 바꾸지 않는다.
-    - 정말 타입 조합이 너무 단조롭거나 데이터와 맞지 않을 때만 보정한다.
-    - B3_ROUTINE_CHECK도 초기 B 슬롯의 정상 핵심 후보로 인정한다.
+    최신 정책:
+    - GPT가 서버 계약을 통과한 미션은 가능한 한 그대로 사용한다.
+    - A1/A2, B1/B2/B3 중 어떤 타입을 고를지는 GPT의 생성 선택을 우선한다.
+    - 서버는 타입 선호를 이유로 정상 GPT 미션을 바꾸지 않는다.
+    - 잘못된 타입/수치/카탈로그/금지 문구는 이 함수가 아니라 검수 단계에서 reject한다.
+
+    이유:
+    - 건강 유지/활동량 낮음 상황에서도 A1_STEP_TARGET은 정상적인 활동형 미션이다.
+    - 이전 로직은 avg_active_kcal_7d가 낮으면 A1을 A2로 강제 변경해
+      provider가 server_rebalance로 남고, GPT 개인화 생성 체감이 줄어들었다.
     """
-
-    mission_map = {
-        m["slot_code"]: m
-        for m in missions
-        if m.get("slot_code") in ["A", "B", "C"]
-    }
-
-    if sorted(mission_map.keys()) != ["A", "B", "C"]:
-        return missions
-
-    avg_active_kcal_7d = int(activity_summary.get("avg_active_kcal_7d", 0) or 0)
-    avg_sleep_minutes_7d = int(activity_summary.get("avg_sleep_minutes_7d", 0) or 0)
-
-    a_type = mission_map["A"].get("suggested_type")
-    b_type = mission_map["B"].get("suggested_type")
-
-    # 활동량이 정말 낮은 경우에만 A2를 강하게 우선한다.
-    # 기존 180 기준은 너무 넓어서 GPT 결과가 자주 server_rebalance로 바뀔 수 있음.
-    if avg_active_kcal_7d <= 150 and a_type != "A2_ACTIVE_KCAL_TARGET":
-        mission_map["A"] = build_initial_slot_fallback_mission(
-            "A",
-            activity_summary,
-            behavior_summary,
-        )
-        a_type = mission_map["A"]["suggested_type"]
-
-    # 수면 데이터가 아예 없는데 B2_SLEEP_PREP가 나오면 B3로 보정한다.
-    # 수면 데이터가 없는 상태에서 수면 준비 미션은 근거가 약하기 때문.
-    if avg_sleep_minutes_7d == 0 and b_type == "B2_SLEEP_PREP":
-        mission_map["B"] = build_b3_routine_fallback_mission(
-            activity_summary,
-            behavior_summary=behavior_summary,
-        )
-        b_type = mission_map["B"]["suggested_type"]
-
-    # 수면 데이터가 있고, 실제로 수면이 낮으면 B2를 우선한다.
-    elif avg_sleep_minutes_7d and avg_sleep_minutes_7d < 360 and b_type != "B2_SLEEP_PREP":
-        mission_map["B"] = build_initial_slot_fallback_mission(
-            "B",
-            activity_summary,
-            behavior_summary,
-        )
-        b_type = mission_map["B"]["suggested_type"]
-
-    # A1 + B1 + C1처럼 너무 기본 조합으로만 나온 경우만 보정한다.
-    # 이제 B3는 정상적인 초기 다양성 타입으로 인정한다.
-    if (
-        a_type != "A2_ACTIVE_KCAL_TARGET"
-        and b_type not in {"B2_SLEEP_PREP", "B3_ROUTINE_CHECK"}
-    ):
-        mission_map["A"] = build_initial_slot_fallback_mission(
-            "A",
-            activity_summary,
-            behavior_summary,
-        )
-
-    return [mission_map["A"], mission_map["B"], mission_map["C"]]
+    return missions
 
 
 def validate_initial_type_balance(
@@ -1223,32 +1665,18 @@ def validate_initial_type_balance(
     """
     초기 3개 미션 타입 균형 검수.
 
-    B3_ROUTINE_CHECK도 초기 B 슬롯의 정상적인 핵심 타입으로 인정한다.
+    최신 정책:
+    - A/B/C 슬롯이 각각 존재하고 개별 미션 검수를 통과했다면 타입 균형은 통과로 본다.
+    - 활동량이 낮다는 이유만으로 A2_ACTIVE_KCAL_TARGET을 강제하지 않는다.
+    - 수면 데이터가 없거나 부족하다는 이유만으로 B2_SLEEP_PREP를 강제/차단하지 않는다.
+
+    실제 안전성은 validate_initial_missions, validate_slot_and_type,
+    validate_params_by_type, validate_a_type_uses_server_selected_target에서 처리한다.
     """
-
-    mission_map = {m["slot_code"]: m for m in missions}
-
-    a_type = mission_map["A"]["suggested_type"]
-    b_type = mission_map["B"]["suggested_type"]
-
-    avg_active_kcal_7d = int(activity_summary.get("avg_active_kcal_7d", 0) or 0)
-    avg_sleep_minutes_7d = int(activity_summary.get("avg_sleep_minutes_7d", 0) or 0)
-
-    # 기존에는 A2 또는 B2만 인정했는데,
-    # 이제 B3도 루틴형 핵심 미션이므로 초기 균형 타입으로 인정한다.
-    if (
-        a_type != "A2_ACTIVE_KCAL_TARGET"
-        and b_type not in {"B2_SLEEP_PREP", "B3_ROUTINE_CHECK"}
-    ):
-        raise ValueError("초기 생성은 A2, B2, B3 중 최소 1개를 포함해야 합니다.")
-
-    # 활동량이 정말 낮은 사용자는 A2를 우선한다.
-    if avg_active_kcal_7d <= 150 and a_type != "A2_ACTIVE_KCAL_TARGET":
-        raise ValueError("최근 활동량이 낮은 사용자 초기 A 슬롯은 A2를 우선 포함해야 합니다.")
-
-    # 수면 데이터가 실제로 있고, 수면 시간이 낮은 경우에만 B2를 강제한다.
-    if avg_sleep_minutes_7d and avg_sleep_minutes_7d < 360 and b_type != "B2_SLEEP_PREP":
-        raise ValueError("최근 수면 시간이 낮은 사용자 초기 B 슬롯은 B2를 우선 포함해야 합니다.")
+    mission_map = {m.get("slot_code"): m for m in missions if isinstance(m, dict)}
+    missing_slots = [slot for slot in ["A", "B", "C"] if slot not in mission_map]
+    if missing_slots:
+        raise ValueError(f"초기 미션에 필요한 슬롯이 누락되었습니다: {missing_slots}")
 
 
 def build_b3_routine_fallback_mission(
@@ -1260,65 +1688,56 @@ def build_b3_routine_fallback_mission(
     avg_active_kcal_7d = int(activity_summary.get("avg_active_kcal_7d", 0) or 0)
 
     prev_params = (previous_mission_summary or {}).get("params") or {}
-    prev_routine_name = str(prev_params.get("routine_name", "") or "").strip()
+    prev_routine_key = normalize_routine_key(prev_params.get("routine_key") or prev_params.get("routine_name"))
     prev_repeat_count = int(prev_params.get("repeat_count", 0) or 0)
     prev_interval_min = int(prev_params.get("interval_min", 0) or 0)
 
-    options = [
-        {"routine_name": "물 마시기", "repeat_count": 3, "interval_min": 10},
-        {"routine_name": "물 마시기", "repeat_count": 4, "interval_min": 10},
-        {"routine_name": "가볍게 일어나기", "repeat_count": 3, "interval_min": 15},
-    ]
+    slot_behavior = get_slot_behavior_summary(behavior_summary, "B")
+    difficulty_bias = str(slot_behavior.get("difficulty_bias") or "neutral")
+    routine_rotation = slot_behavior.get("routine_rotation") or (behavior_summary or {}).get("b3_routine_rotation") or {}
+    recent_routine_keys = list((routine_rotation or {}).get("recent_routine_keys") or [])
+    blocked_routine_keys = list((routine_rotation or {}).get("blocked_routine_keys") or [])
 
-    if avg_steps_7d >= 6000 or avg_active_kcal_7d >= 220:
-        options = [
-            {"routine_name": "물 마시기", "repeat_count": 4, "interval_min": 15},
-            {"routine_name": "가볍게 일어나기", "repeat_count": 3, "interval_min": 15},
-            {"routine_name": "물 마시기", "repeat_count": 3, "interval_min": 10},
-        ]
+    activity_status = "good" if (avg_steps_7d >= 6000 or avg_active_kcal_7d >= 220) else "low"
+    candidates = build_routine_candidates(
+        difficulty="normal" if activity_status == "good" and difficulty_bias != "down" else "easy",
+        goal_direction="health_maintenance",
+        activity_status=activity_status,
+        sleep_status="unknown",
+        data_confidence="medium" if (avg_steps_7d or avg_active_kcal_7d) else "low",
+        difficulty_bias=difficulty_bias,
+        previous_routine_key=prev_routine_key,
+        recent_routine_keys=recent_routine_keys,
+        blocked_routine_keys=blocked_routine_keys,
+        limit=8,
+    )
 
-    difficulty_bias = str(get_slot_behavior_summary(behavior_summary, "B").get("difficulty_bias") or "neutral")
-    options = adjust_routine_candidates_by_bias(options, difficulty_bias)
-
-    choice = options[0]
-    for option in options:
+    choice = candidates[0]
+    for option in candidates:
         if (
-            option["routine_name"] != prev_routine_name
+            option["routine_key"] != prev_routine_key
             or option["repeat_count"] != prev_repeat_count
             or option["interval_min"] != prev_interval_min
         ):
             choice = option
             break
 
-    return build_routine_check_mission_data(
-        choice["routine_name"],
-        choice["repeat_count"],
-        choice["interval_min"],
+    return build_routine_mission_payload(
+        routine_key=choice["routine_key"],
+        repeat_count=choice["repeat_count"],
+        interval_min=choice["interval_min"],
     )
 
 
 def build_c1_fallback_mission(
     previous_mission_summary: Optional[Dict[str, Any]] = None,
     behavior_summary: Optional[Dict[str, Any]] = None,
+    health_gap: Optional[Dict[str, Any]] = None,
+    user_profile: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    prev_title = str((previous_mission_summary or {}).get("title") or "").strip()
     prev_params = (previous_mission_summary or {}).get("params") or {}
     prev_min_length = int(prev_params.get("min_length", 0) or 0)
-
-    variants = [
-        {
-            "title": "컨디션 기록 미션에 도전해보세요",
-            "description": "몸 상태와 기분을 최소 {min_length}자 이상 기록해보세요.",
-        },
-        {
-            "title": "몸 상태를 기록해보세요",
-            "description": "지금 몸 상태와 컨디션 변화를 최소 {min_length}자 이상 적어보세요.",
-        },
-        {
-            "title": "오늘 컨디션을 남겨보세요",
-            "description": "지금 기분과 몸 상태를 최소 {min_length}자 이상 기록해보세요.",
-        },
-    ]
+    prev_checkin_key = str(prev_params.get("checkin_key") or "").strip()
 
     difficulty_bias = str(get_slot_behavior_summary(behavior_summary, "C").get("difficulty_bias") or "neutral")
     min_length_candidates = shift_numeric_candidates_by_bias(
@@ -1328,13 +1747,28 @@ def build_c1_fallback_mission(
     )
     min_length = choose_candidate(min_length_candidates, prev_min_length or None)
 
-    chosen = variants[0]
-    for variant in variants:
-        if variant["title"] != prev_title:
-            chosen = variant
+    goal_direction = "weight_loss_support" if str((user_profile or {}).get("goal") or "").replace(" ", "") in {"체중감량", "weight_loss", "weightlosssupport"} else "health_maintenance"
+    candidates = build_checkin_candidates(
+        goal_direction=goal_direction,
+        activity_status=str((health_gap or {}).get("activity_status") or "unknown"),
+        sleep_status=str((health_gap or {}).get("sleep_status") or "unknown"),
+        data_confidence=str((health_gap or {}).get("data_confidence") or "medium"),
+        difficulty="easy" if difficulty_bias == "down" else "normal",
+        difficulty_bias=difficulty_bias,
+        previous_checkin_key=prev_checkin_key,
+        limit=6,
+    )
+
+    choice = candidates[0] if candidates else {"checkin_key": "condition_today", "min_length": min_length}
+    for candidate in candidates:
+        if candidate.get("checkin_key") != prev_checkin_key or int(candidate.get("min_length") or 0) != prev_min_length:
+            choice = candidate
             break
 
-    return build_checkin_mission_data(chosen["title"], chosen["description"], min_length)
+    return build_checkin_mission_payload(
+        checkin_key=choice.get("checkin_key") or "condition_today",
+        min_length=min_length,
+    )
 
 
 def get_existing_active_missions(db: Session, user_id: int) -> List[UserMission]:
@@ -1401,15 +1835,20 @@ def canonicalize_mission_params(suggested_type: str, params: Optional[Dict[str, 
         }
 
     if suggested_type == "B3_ROUTINE_CHECK":
+        normalized = normalize_routine_params(params)
         return {
-            "routine_name": str(params.get("routine_name", "") or "").strip().lower(),
-            "repeat_count": int(params.get("repeat_count", 0) or 0),
-            "interval_min": int(params.get("interval_min", 0) or 0),
+            "routine_key": normalized["routine_key"],
+            "routine_name": normalized["routine_name"],
+            "repeat_count": int(normalized.get("repeat_count", 0) or 0),
+            "interval_min": int(normalized.get("interval_min", 0) or 0),
         }
 
     if suggested_type == "C1_HEALTH_CHECKIN":
+        normalized = normalize_checkin_params(params)
         return {
-            "min_length": int(params.get("min_length", 0) or 0),
+            "checkin_key": normalized["checkin_key"],
+            "checkin_label": normalized["checkin_label"],
+            "min_length": int(normalized.get("min_length", 0) or 0),
         }
 
     return params
@@ -1523,6 +1962,9 @@ def build_retry_fallback_mission(
     previous_mission_summary: Optional[Dict[str, Any]] = None,
     activity_summary: Optional[Dict[str, Any]] = None,
     behavior_summary: Optional[Dict[str, Any]] = None,
+    health_gap: Optional[Dict[str, Any]] = None,
+    user_profile: Optional[Dict[str, Any]] = None,
+    personalization_policy: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     activity_summary = activity_summary or {}
     prev_type = get_previous_mission_type(previous_mission_summary)
@@ -1534,49 +1976,24 @@ def build_retry_fallback_mission(
     )
 
     if slot_code == "A":
-        avg_steps_7d = int(activity_summary.get("avg_steps_7d", 0) or 0)
         avg_active_kcal_7d = int(activity_summary.get("avg_active_kcal_7d", 0) or 0)
-        difficulty_bias = str(get_slot_behavior_summary(behavior_summary, "A").get("difficulty_bias") or "neutral")
-
-        if avg_steps_7d <= 2000:
-            step_candidates = [2500, 3000, 3500]
-        elif avg_steps_7d <= 4000:
-            step_candidates = [3500, 4000, 4500]
-        elif avg_steps_7d <= 6000:
-            step_candidates = [4500, 5000, 5500]
-        elif avg_steps_7d <= 8000:
-            step_candidates = [5500, 6000, 7000]
-        else:
-            step_candidates = [7000, 8000, 9000]
-
-        if avg_active_kcal_7d <= 80:
-            kcal_candidates = [80, 100, 120]
-        elif avg_active_kcal_7d <= 140:
-            kcal_candidates = [100, 120, 150]
-        elif avg_active_kcal_7d <= 200:
-            kcal_candidates = [150, 180, 220]
-        elif avg_active_kcal_7d <= 280:
-            kcal_candidates = [180, 220, 250]
-        else:
-            kcal_candidates = [220, 250, 300]
-
-        step_candidates = shift_numeric_candidates_by_bias(step_candidates, STEP_TARGET_MASTER, difficulty_bias)
-        kcal_candidates = shift_numeric_candidates_by_bias(kcal_candidates, KCAL_TARGET_MASTER, difficulty_bias)
+        selected_steps, selected_kcal = build_a_target_values_for_fallback(
+            activity_summary,
+            behavior_summary=behavior_summary,
+            personalization_policy=personalization_policy,
+            previous_mission=previous_mission_summary,
+        )
 
         if prev_type == "A1_STEP_TARGET":
-            prev_kcal = int(prev_params.get("target_kcal", 0) or 0)
-            return build_active_kcal_mission_data(choose_candidate(kcal_candidates, prev_kcal or None))
+            return build_active_kcal_mission_data(selected_kcal)
 
         if prev_type == "A2_ACTIVE_KCAL_TARGET":
-            prev_steps = int(prev_params.get("target_steps", 0) or 0)
-            return build_step_target_mission_data(choose_candidate(step_candidates, prev_steps or None))
+            return build_step_target_mission_data(selected_steps)
 
         if preferred_type == "A2_ACTIVE_KCAL_TARGET" or avg_active_kcal_7d <= 180:
-            prev_kcal = int(prev_params.get("target_kcal", 0) or 0)
-            return build_active_kcal_mission_data(choose_candidate(kcal_candidates, prev_kcal or None))
+            return build_active_kcal_mission_data(selected_kcal)
 
-        prev_steps = int(prev_params.get("target_steps", 0) or 0)
-        return build_step_target_mission_data(choose_candidate(step_candidates, prev_steps or None))
+        return build_step_target_mission_data(selected_steps)
 
     if slot_code == "B":
         avg_active_kcal_7d = int(activity_summary.get("avg_active_kcal_7d", 0) or 0)
@@ -1630,7 +2047,7 @@ def build_retry_fallback_mission(
         prev_duration = int(prev_params.get("duration_min", 0) or 0)
         return build_sleep_prep_mission_data(choose_candidate(sleep_candidates, prev_duration or None))
 
-    return build_c1_fallback_mission(previous_mission_summary, behavior_summary)
+    return build_c1_fallback_mission(previous_mission_summary, behavior_summary, health_gap, user_profile)
 
 def attach_generation_meta(
     mission_data: Dict[str, Any],
@@ -1654,6 +2071,147 @@ def attach_generation_meta(
     return copied
 
 
+def classify_validation_error_codes(message: Optional[str]) -> List[str]:
+    """검수/생성 실패 문장을 발표용 코드로 축약한다.
+
+    한 실패가 여러 원인을 가질 수 있으므로 list로 저장한다.
+    이 값은 나중에 PPT에서 "금지 문구 실패율", "B3 계약 실패율"처럼
+    카테고리별 그래프를 만들 때 사용한다.
+    """
+
+    text = str(message or "").lower()
+    codes: List[str] = []
+
+    checks = [
+        ("json_parse_error", ["json", "파싱", "payload", "리스트 형식", "missions"]),
+        ("missing_required_field", ["필드 누락", "값이 비어", "필요합니다", "required"]),
+        ("forbidden_text", ["금지 문구", "실패", "마감", "오늘까지", "제한 시간"]),
+        ("slot_type_mismatch", ["slot_code", "허용되지 않은", "일치하지", "mission_type과 suggested_type"]),
+        ("params_candidate_invalid", ["params", "중 하나", "actual="]),
+        ("routine_catalog_invalid", ["routine_key", "routine_name", "카탈로그", "b3_routine_check"]),
+        ("reason_invalid", ["reason", "너무 일반적", "너무 짧", "너무 깁"]),
+        ("duplicate_or_rotation", ["중복", "동일", "반복", "rotation"]),
+        ("type_balance_invalid", ["초기 생성", "초기 a 슬롯", "초기 b 슬롯", "균형"]),
+        ("openai_api_error", ["openai", "api", "timeout", "rate"]),
+    ]
+
+    for code, keywords in checks:
+        if any(keyword in text for keyword in keywords):
+            codes.append(code)
+
+    if not codes and text:
+        codes.append("other_validation_error")
+
+    return codes
+
+
+def build_generation_trace_for_log(
+    *,
+    mode: str,
+    mission_count: int,
+    slot_codes: List[str],
+    user_profile: Dict[str, Any],
+    activity_summary: Dict[str, Any],
+    comparison: Dict[str, Any],
+    public_average: Dict[str, Any],
+    health_gap: Dict[str, Any],
+    existing_missions: Optional[List[Dict[str, Any]]] = None,
+    previous_mission: Optional[Dict[str, Any]] = None,
+    retry_attempt: int = 1,
+    behavior_summary: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """GPT 입력 계약/개인화 정책을 로그에 같이 남기기 위한 trace payload.
+
+    GPTService._build_user_prompt가 쓰는 payload와 같은 생성 함수를 호출하므로,
+    실제 GPT 입력과 로그에 저장되는 정책 결과가 어긋나지 않는다.
+    """
+
+    return GPTService.build_generation_trace_context(
+        mode=mode,
+        mission_count=mission_count,
+        slot_codes=slot_codes,
+        user_profile=user_profile,
+        activity_summary=activity_summary,
+        comparison=comparison,
+        public_average=public_average,
+        health_gap=health_gap,
+        existing_missions=existing_missions,
+        previous_mission=previous_mission,
+        retry_attempt=retry_attempt,
+        behavior_summary=behavior_summary,
+        system_prompt_enabled=SYSTEM_PROMPT_ENABLED,
+    )
+
+
+def build_generation_input_summary(
+    *,
+    user_profile: Dict[str, Any],
+    activity_summary: Dict[str, Any],
+    comparison: Dict[str, Any],
+    public_average: Dict[str, Any],
+    health_gap: Dict[str, Any],
+    behavior_summary: Optional[Dict[str, Any]],
+    generation_trace: Dict[str, Any],
+    existing_missions: Optional[List[Dict[str, Any]]] = None,
+    previous_mission: Optional[Dict[str, Any]] = None,
+    disallowed_types: Optional[List[str]] = None,
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    summary = {
+        "user_profile": user_profile,
+        "activity_summary": activity_summary,
+        "comparison": comparison,
+        "public_average": public_average,
+        "health_gap": health_gap,
+        "behavior_summary": behavior_summary,
+        "existing_missions": existing_missions or [],
+        "previous_mission": previous_mission,
+        "disallowed_types": disallowed_types or [],
+        "generation_trace": generation_trace,
+    }
+    if extra:
+        summary.update(extra)
+    return summary
+
+
+def extract_policy_output_for_log(input_summary: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    trace = (input_summary or {}).get("generation_trace") or {}
+    policy = trace.get("personalization_policy")
+    if not policy:
+        return None
+    return {
+        "policy_version": policy.get("policy_version"),
+        "source": policy.get("source"),
+        "mode": policy.get("mode"),
+        "slot_codes": policy.get("slot_codes"),
+        "goal_policy": policy.get("goal_policy"),
+        "difficulty_by_slot": policy.get("difficulty_by_slot"),
+        "effective_bias_by_slot": policy.get("effective_bias_by_slot"),
+        "type_priority_by_slot": policy.get("type_priority_by_slot"),
+        "discouraged_types_by_slot": policy.get("discouraged_types_by_slot"),
+        "target_candidates_by_slot": policy.get("target_candidates_by_slot"),
+        "reason_basis_by_slot": policy.get("reason_basis_by_slot"),
+        "reason_basis": policy.get("reason_basis"),
+        "notes": policy.get("notes"),
+    }
+
+
+def extract_prompt_metadata_for_log(input_summary: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    trace = (input_summary or {}).get("generation_trace") or {}
+    metadata = trace.get("prompt_metadata") or {}
+    personalization_policy = trace.get("personalization_policy") or {}
+    output_contract = trace.get("output_contract") or {}
+    routine_catalog = trace.get("routine_catalog") or {}
+
+    return {
+        "prompt_version": metadata.get("prompt_version") or MISSION_GPT_PROMPT_VERSION,
+        "policy_version": metadata.get("policy_version") or personalization_policy.get("policy_version"),
+        "contract_version": metadata.get("contract_version") or output_contract.get("contract_version") or MISSION_OUTPUT_CONTRACT_VERSION,
+        "routine_catalog_version": routine_catalog.get("catalog_version") or ROUTINE_CATALOG_VERSION,
+        "experiment_variant": metadata.get("experiment_variant") or MISSION_GPT_EXPERIMENT_VARIANT,
+        "system_prompt_enabled": bool(metadata.get("system_prompt_enabled", SYSTEM_PROMPT_ENABLED)),
+    }
+
 def add_generation_log(
     db: Optional[Session],
     *,
@@ -1673,9 +2231,47 @@ def add_generation_log(
     raw_response_text: Optional[str] = None,
     input_summary: Optional[Dict[str, Any]] = None,
     output_mission: Optional[Dict[str, Any]] = None,
+    retry_count: Optional[int] = None,
+    fallback_used: Optional[bool] = None,
+    validation_error_codes: Optional[List[str]] = None,
+    policy_output: Optional[Dict[str, Any]] = None,
+    experiment_meta: Optional[Dict[str, Any]] = None,
 ) -> None:
     if db is None:
         return
+
+    prompt_metadata = extract_prompt_metadata_for_log(input_summary)
+    effective_retry_count = int(retry_count if retry_count is not None else max(attempt_no, 0))
+    effective_fallback_used = bool(
+        fallback_used
+        if fallback_used is not None
+        else (provider == "server_fallback" or outcome == "fallback_used")
+    )
+    effective_error_codes = validation_error_codes or classify_validation_error_codes(
+        validation_reason or error_message or fallback_reason
+    )
+    effective_policy_output = policy_output or extract_policy_output_for_log(input_summary)
+
+    effective_experiment_meta = {
+        "mode": mode,
+        "slot_code": slot_code,
+        "requested_count": requested_count,
+        "phase": phase,
+        "attempt_no": attempt_no,
+        "provider": provider,
+        "outcome": outcome,
+        "prompt_version": prompt_metadata["prompt_version"],
+        "policy_version": prompt_metadata.get("policy_version"),
+        "contract_version": prompt_metadata["contract_version"],
+        "routine_catalog_version": prompt_metadata["routine_catalog_version"],
+        "experiment_variant": prompt_metadata["experiment_variant"],
+        "system_prompt_enabled": prompt_metadata["system_prompt_enabled"],
+        "retry_count": effective_retry_count,
+        "fallback_used": effective_fallback_used,
+        "validation_error_codes": effective_error_codes,
+    }
+    if experiment_meta:
+        effective_experiment_meta.update(experiment_meta)
 
     db.add(
         MissionGenerationLog(
@@ -1692,6 +2288,17 @@ def add_generation_log(
             validation_reason=validation_reason,
             fallback_reason=fallback_reason,
             error_message=error_message,
+            prompt_version=prompt_metadata["prompt_version"],
+            policy_version=prompt_metadata.get("policy_version"),
+            contract_version=prompt_metadata["contract_version"],
+            routine_catalog_version=prompt_metadata["routine_catalog_version"],
+            experiment_variant=prompt_metadata["experiment_variant"],
+            system_prompt_enabled=prompt_metadata["system_prompt_enabled"],
+            retry_count=effective_retry_count,
+            fallback_used=effective_fallback_used,
+            validation_error_codes_json=effective_error_codes,
+            policy_output_json=effective_policy_output,
+            experiment_meta_json=effective_experiment_meta,
             raw_response_text=raw_response_text,
             input_summary_json=input_summary,
             output_mission_json=output_mission,
@@ -1724,6 +2331,8 @@ async def generate_single_slot_mission_with_fallback(
     3) GPT 실패/검수 실패가 반복되면 provider='server_fallback'
     """
 
+    max_attempts = 2 if slot_code == "B" else 3
+
     try:
         return await generate_unique_single_slot_mission(
             mode=mode,
@@ -1736,7 +2345,7 @@ async def generate_single_slot_mission_with_fallback(
             existing_missions_summary=existing_missions_summary,
             previous_mission_summary=previous_mission_summary,
             disallowed_types=disallowed_types,
-            max_attempts=3,
+            max_attempts=max_attempts,
             behavior_summary=behavior_summary,
             db=db,
             user_id=user_id,
@@ -1744,16 +2353,48 @@ async def generate_single_slot_mission_with_fallback(
 
     except Exception as e:
         raw_response_text = getattr(e, "raw_response_text", None)
-        fallback_reason = f"GPT 생성/검수 3회 실패 후 서버 fallback 사용: {str(e)}"
+        fallback_reason = f"GPT 생성/검수 {max_attempts}회 실패 후 서버 fallback 사용: {str(e)}"
 
+        fallback_trace = build_generation_trace_for_log(
+            mode=mode,
+            mission_count=1,
+            slot_codes=[slot_code],
+            user_profile=user_profile,
+            activity_summary=activity_summary,
+            comparison=comparison,
+            public_average=public_average,
+            health_gap=health_gap,
+            existing_missions=existing_missions_summary,
+            previous_mission=previous_mission_summary,
+            retry_attempt=max_attempts,
+            behavior_summary=behavior_summary,
+        )
+        fallback_policy = fallback_trace.get("personalization_policy") or {}
         fallback_mission = build_retry_fallback_mission(
             slot_code=slot_code,
             previous_mission_summary=previous_mission_summary,
             activity_summary=activity_summary,
             behavior_summary=behavior_summary,
+            health_gap=health_gap,
+            user_profile=user_profile,
+            personalization_policy=fallback_policy,
         )
+        validate_single_slot_mission(fallback_mission, slot_code, fallback_policy)
 
         if user_id is not None:
+            fallback_input_summary = build_generation_input_summary(
+                user_profile=user_profile,
+                activity_summary=activity_summary,
+                comparison=comparison,
+                public_average=public_average,
+                health_gap=health_gap,
+                behavior_summary=behavior_summary,
+                generation_trace=fallback_trace,
+                existing_missions=existing_missions_summary,
+                previous_mission=previous_mission_summary,
+                disallowed_types=list(disallowed_types),
+            )
+
             add_generation_log(
                 db,
                 user_id=user_id,
@@ -1769,24 +2410,16 @@ async def generate_single_slot_mission_with_fallback(
                 fallback_reason=fallback_reason,
                 error_message=str(e),
                 raw_response_text=raw_response_text,
-                input_summary={
-                    "user_profile": user_profile,
-                    "activity_summary": activity_summary,
-                    "comparison": comparison,
-                    "public_average": public_average,
-                    "health_gap": health_gap,
-                    "existing_missions": existing_missions_summary,
-                    "previous_mission": previous_mission_summary,
-                    "disallowed_types": list(disallowed_types),
-                    "behavior_summary": behavior_summary,
-                },
+                input_summary=fallback_input_summary,
                 output_mission=fallback_mission,
+                retry_count=max_attempts,
+                fallback_used=True,
             )
 
         return attach_generation_meta(
             fallback_mission,
             provider="server_fallback",
-            attempt_count=3,
+            attempt_count=max_attempts,
             phase="fallback",
             fallback_reason=fallback_reason,
         )
@@ -1815,19 +2448,34 @@ async def generate_unique_single_slot_mission(
 
     last_error: Optional[Exception] = None
 
-    input_summary = {
-        "user_profile": user_profile,
-        "activity_summary": activity_summary,
-        "comparison": comparison,
-        "public_average": public_average,
-        "health_gap": health_gap,
-        "existing_missions": existing_missions_summary,
-        "previous_mission": previous_mission_summary,
-        "disallowed_types": list(disallowed_types),
-        "behavior_summary": behavior_summary,
-    }
-
     for attempt in range(1, max_attempts + 1):
+        attempt_trace = build_generation_trace_for_log(
+            mode=mode,
+            mission_count=1,
+            slot_codes=[slot_code],
+            user_profile=user_profile,
+            activity_summary=activity_summary,
+            comparison=comparison,
+            public_average=public_average,
+            health_gap=health_gap,
+            existing_missions=existing_missions_summary,
+            previous_mission=previous_mission_summary,
+            retry_attempt=attempt,
+            behavior_summary=behavior_summary,
+        )
+        input_summary = build_generation_input_summary(
+            user_profile=user_profile,
+            activity_summary=activity_summary,
+            comparison=comparison,
+            public_average=public_average,
+            health_gap=health_gap,
+            behavior_summary=behavior_summary,
+            generation_trace=attempt_trace,
+            existing_missions=existing_missions_summary,
+            previous_mission=previous_mission_summary,
+            disallowed_types=list(disallowed_types),
+        )
+
         try:
             missions = await GPTService.generate_structured_missions(
                 mode=mode,
@@ -1847,9 +2495,19 @@ async def generate_unique_single_slot_mission(
             if len(missions) != 1:
                 raise ValueError("GPT가 슬롯 재생성 미션 1개를 정확히 반환하지 않았습니다.")
 
-            mission_data = normalize_generated_mission(missions[0])
+            mission_data = ensure_mission_reason_for_validation(
+                normalize_generated_mission(missions[0]),
+                comparison=comparison,
+                activity_summary=activity_summary,
+                public_average=public_average,
+                behavior_summary=behavior_summary,
+            )
 
-            validate_single_slot_mission(mission_data, expected_slot_code=slot_code)
+            validate_single_slot_mission(
+                mission_data,
+                expected_slot_code=slot_code,
+                personalization_policy=attempt_trace.get("personalization_policy"),
+            )
             validate_not_same_as_previous(mission_data, previous_mission_summary)
 
             validate_regeneration_type_rotation(
@@ -2010,6 +2668,67 @@ def scale_b3_reward_by_ratio(ratio: float) -> Dict[str, int]:
         "coins": int(coins),
     }
 
+
+
+def scale_c_reward_by_ratio(ratio: float) -> Dict[str, int]:
+    """C1 기록형 보상 계산. min_length 15/20/25 기준으로 보상을 차등 지급한다."""
+    ratio = clamp_number(ratio, 0.0, 1.0)
+    exp = round(5 + (10 - 5) * ratio)
+    coins = round(5 + (10 - 5) * ratio)
+    return {"exp": int(exp), "coins": int(coins)}
+
+
+def classify_difficulty_by_ratio(ratio: float) -> str:
+    """수치형 params 비율을 easy/normal/hard로 변환한다."""
+    ratio = clamp_number(ratio, 0.0, 1.0)
+    if ratio <= 0.34:
+        return "easy"
+    if ratio <= 0.67:
+        return "normal"
+    return "hard"
+
+
+def get_mission_difficulty(
+    *,
+    mission_type: str,
+    params: Optional[Dict[str, Any]] = None,
+) -> str:
+    """미션 params의 최소/최대 수치 기준으로 난이도를 판정한다."""
+    params = params or {}
+    try:
+        if mission_type == "A1_STEP_TARGET":
+            target_steps = int(params.get("target_steps", min(STEP_TARGET_MASTER)) or min(STEP_TARGET_MASTER))
+            return classify_difficulty_by_ratio(normalize_range(target_steps, min(STEP_TARGET_MASTER), max(STEP_TARGET_MASTER)))
+
+        if mission_type == "A2_ACTIVE_KCAL_TARGET":
+            target_kcal = int(params.get("target_kcal", min(KCAL_TARGET_MASTER)) or min(KCAL_TARGET_MASTER))
+            return classify_difficulty_by_ratio(normalize_range(target_kcal, min(KCAL_TARGET_MASTER), max(KCAL_TARGET_MASTER)))
+
+        if mission_type == "B1_TIMER_STRETCH":
+            duration_min = int(params.get("duration_min", min(STRETCH_DURATION_MASTER)) or min(STRETCH_DURATION_MASTER))
+            return classify_difficulty_by_ratio(normalize_range(duration_min, min(STRETCH_DURATION_MASTER), max(STRETCH_DURATION_MASTER)))
+
+        if mission_type == "B2_SLEEP_PREP":
+            duration_min = int(params.get("duration_min", min(SLEEP_PREP_DURATION_MASTER)) or min(SLEEP_PREP_DURATION_MASTER))
+            return classify_difficulty_by_ratio(normalize_range(duration_min, min(SLEEP_PREP_DURATION_MASTER), max(SLEEP_PREP_DURATION_MASTER)))
+
+        if mission_type == "B3_ROUTINE_CHECK":
+            repeat_count = int(params.get("repeat_count", min(ALLOWED_REPEAT_COUNTS)) or min(ALLOWED_REPEAT_COUNTS))
+            interval_min = int(params.get("interval_min", max(ALLOWED_INTERVAL_MINUTES)) or max(ALLOWED_INTERVAL_MINUTES))
+            repeat_ratio = normalize_range(repeat_count, min(ALLOWED_REPEAT_COUNTS), max(ALLOWED_REPEAT_COUNTS))
+            interval_min = clamp_number(interval_min, min(ALLOWED_INTERVAL_MINUTES), max(ALLOWED_INTERVAL_MINUTES))
+            interval_ratio = normalize_range(max(ALLOWED_INTERVAL_MINUTES) - interval_min, 0, max(ALLOWED_INTERVAL_MINUTES) - min(ALLOWED_INTERVAL_MINUTES))
+            return classify_difficulty_by_ratio((repeat_ratio * 0.7) + (interval_ratio * 0.3))
+
+        if mission_type == "C1_HEALTH_CHECKIN":
+            min_length = int(params.get("min_length", min(ALLOWED_CHECKIN_MIN_LENGTHS)) or min(ALLOWED_CHECKIN_MIN_LENGTHS))
+            return classify_difficulty_by_ratio(normalize_range(min_length, min(ALLOWED_CHECKIN_MIN_LENGTHS), max(ALLOWED_CHECKIN_MIN_LENGTHS)))
+
+    except (TypeError, ValueError):
+        return "easy"
+
+    return "easy"
+
 def get_mission_reward(
     *,
     mission_type: str,
@@ -2025,9 +2744,16 @@ def get_mission_reward(
 
     params = params or {}
 
-    # C 타입은 항상 고정 보상
+    # C1: 기록형 체크인
+    # 15자 = 쉬움, 20자 = 보통, 25자 = 어려움
     if mission_type == "C1_HEALTH_CHECKIN":
-        return C_TYPE_FIXED_REWARD
+        min_length = int(params.get("min_length", min(ALLOWED_CHECKIN_MIN_LENGTHS)) or min(ALLOWED_CHECKIN_MIN_LENGTHS))
+        ratio = normalize_range(
+            min_length,
+            min(ALLOWED_CHECKIN_MIN_LENGTHS),
+            max(ALLOWED_CHECKIN_MIN_LENGTHS),
+        )
+        return scale_c_reward_by_ratio(ratio)
 
     # A1: 걸음 수 목표
     # 2500보 = 쉬움, 9000보 = 어려움
@@ -2196,14 +2922,20 @@ def create_mission_row(
     public_average: Optional[Dict[str, Any]] = None,
     behavior_summary: Optional[Dict[str, Any]] = None,
 ) -> UserMission:
+    mission_data = normalize_generated_mission(mission_data)
     mission_data = apply_a_type_minimum_label(mission_data)
 
     slot_code = mission_data["slot_code"]
     mission_type = mission_data["suggested_type"]
 
+    mission_params = mission_data.get("params") or {}
     reward_info = get_mission_reward(
         mission_type=mission_type,
-        params=mission_data.get("params") or {},
+        params=mission_params,
+    )
+    mission_difficulty = get_mission_difficulty(
+        mission_type=mission_type,
+        params=mission_params,
     )
 
     progress_json = {}
@@ -2244,7 +2976,7 @@ def create_mission_row(
         content=mission_data["description"],
         reason=reason,
         category="AI_MISSION",
-        difficulty="normal",
+        difficulty=mission_difficulty,
         is_completed=False,
         is_refreshed=False,
         slot_code=slot_code,
@@ -2633,11 +3365,12 @@ async def seed_standards(db: Session = Depends(get_db)):
 # 4. 신버전 슬롯 기반 미션 시스템
 # ============================
 
-@router.post("/generate-initial")
-async def generate_initial_missions(
+async def generate_initial_missions_core(
     req: GenerateInitialMissionsRequest,
-    db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    db: Session,
+    user: User,
+    progress: Optional[MissionProgressCallback] = None,
+    generation_id: Optional[str] = None,
 ):
     """
     최초 AI 미션 3개 생성
@@ -2645,6 +3378,17 @@ async def generate_initial_missions(
     - A/B/C 슬롯 각각 1개씩 생성
     - 이미 active 미션이 있으면 중복 생성 방지
     """
+
+    await emit_generation_progress(
+        progress,
+        generation_id=generation_id,
+        stage="checking_health_data",
+        label="헬스 데이터 확인 중",
+        detail="인바디와 활동 기록이 미션 생성에 사용할 수 있는 상태인지 확인하고 있어요.",
+        progress_percent=8,
+        step_index=1,
+        total_steps=INITIAL_GENERATION_TOTAL_STEPS,
+    )
 
     # 1) 헬스 데이터 확인
     latest_inbody = (
@@ -2667,6 +3411,17 @@ async def generate_initial_missions(
         .first()
     )
 
+    await emit_generation_progress(
+        progress,
+        generation_id=generation_id,
+        stage="checking_existing_missions",
+        label="기존 미션 확인 중",
+        detail="이미 활성화된 미션이 있는지 확인하고, 필요한 경우 교체 준비를 하고 있어요.",
+        progress_percent=16,
+        step_index=2,
+        total_steps=INITIAL_GENERATION_TOTAL_STEPS,
+    )
+
     # 2) 기존 active / in_progress 미션 체크
     existing_active_missions = (
         db.query(UserMission)
@@ -2687,7 +3442,28 @@ async def generate_initial_missions(
             mission.status = "refreshed"
             mission.is_refreshed = True
             db.add(mission)
+            log_mission_event(
+                db,
+                user_id=user.id,
+                mission=mission,
+                event_type=MISSION_EVENT_REFRESHED,
+                event_meta={
+                    "source": "force_regenerate_initial",
+                    "reason": "기존 활성 미션을 초기 미션 재생성으로 교체",
+                },
+            )
         db.flush()
+
+    await emit_generation_progress(
+        progress,
+        generation_id=generation_id,
+        stage="preparing_game_profile",
+        label="게임 프로필 준비 중",
+        detail="EXP, 코인, 무료 재생성 횟수 같은 게임 정보를 확인하고 있어요.",
+        progress_percent=24,
+        step_index=3,
+        total_steps=INITIAL_GENERATION_TOTAL_STEPS,
+    )
 
     # 3) 게임 프로필 생성
     profile = ensure_game_profile(db, user.id)
@@ -2699,21 +3475,106 @@ async def generate_initial_missions(
         profile.mission_coins = 0
 
     # 4) GPT 입력 데이터 준비
+    await emit_generation_progress(
+        progress,
+        generation_id=generation_id,
+        stage="building_user_summary",
+        label="사용자 건강 요약 중",
+        detail="키, 몸무게, BMI, 목표, 체지방 정보를 미션용 요약 데이터로 정리하고 있어요.",
+        progress_percent=32,
+        step_index=4,
+        total_steps=INITIAL_GENERATION_TOTAL_STEPS,
+    )
     user_profile = build_user_profile_summary(latest_inbody, user)
+
+    await emit_generation_progress(
+        progress,
+        generation_id=generation_id,
+        stage="building_activity_summary",
+        label="이번 주 활동 평균 계산 중",
+        detail="히스토리 화면과 같은 기준으로 걸음 수와 활동 칼로리 평균을 계산하고 있어요.",
+        progress_percent=40,
+        step_index=5,
+        total_steps=INITIAL_GENERATION_TOTAL_STEPS,
+    )
     recent_activities = get_recent_activity_records(db, user.id, days=7)
     activity_summary = build_activity_summary(latest_activity, recent_activities)
 
+    await emit_generation_progress(
+        progress,
+        generation_id=generation_id,
+        stage="building_health_gap",
+        label="공공 기준과 건강 격차 분석 중",
+        detail="공공 평균과 앱 기준을 참고해 현재 상태를 비교하고 있어요.",
+        progress_percent=50,
+        step_index=6,
+        total_steps=INITIAL_GENERATION_TOTAL_STEPS,
+    )
     public_average = await get_public_average_summary(db, latest_inbody, user)
-    health_gap = build_health_gap_summary(latest_inbody, latest_activity, public_average)
-    comparison = build_comparison_summary(latest_inbody, latest_activity, public_average)
+    health_gap = build_health_gap_summary(latest_inbody, latest_activity, public_average, activity_summary)
+    comparison = build_comparison_summary(
+        latest_inbody,
+        latest_activity,
+        public_average,
+        activity_summary,
+        health_gap,
+    )
     behavior_summary = build_behavior_adaptation_summary(db, user.id)
+
+    await emit_generation_progress(
+        progress,
+        generation_id=generation_id,
+        stage="building_personalization_policy",
+        label="개인화 정책 계산 중",
+        detail="목표, 활동 평균, 최근 새로고침/완료 이력을 반영해 미션 수치와 루틴 후보를 정하고 있어요.",
+        progress_percent=62,
+        step_index=7,
+        total_steps=INITIAL_GENERATION_TOTAL_STEPS,
+    )
 
     # 5) GPT 호출 + 초기 타입 편향 보정
     missions: Optional[List[Dict[str, Any]]] = None
     last_generation_error: Optional[Exception] = None
 
     for attempt in range(1, 5):
+        attempt_trace = build_generation_trace_for_log(
+            mode="initial",
+            mission_count=3,
+            slot_codes=["A", "B", "C"],
+            user_profile=user_profile,
+            activity_summary=activity_summary,
+            comparison=comparison,
+            public_average=public_average,
+            health_gap=health_gap,
+            existing_missions=[],
+            previous_mission=None,
+            retry_attempt=attempt,
+            behavior_summary=behavior_summary,
+        )
+        base_input_summary = build_generation_input_summary(
+            user_profile=user_profile,
+            activity_summary=activity_summary,
+            comparison=comparison,
+            public_average=public_average,
+            health_gap=health_gap,
+            behavior_summary=behavior_summary,
+            generation_trace=attempt_trace,
+            existing_missions=[],
+            previous_mission=None,
+        )
+
         try:
+            await emit_generation_progress(
+                progress,
+                generation_id=generation_id,
+                stage="calling_gpt",
+                label="AI 미션 생성 중",
+                detail=f"개인화 정책 안에서 A/B/C 미션과 추천 이유를 생성하고 있어요. ({attempt}차 시도)",
+                progress_percent=72,
+                step_index=8,
+                total_steps=INITIAL_GENERATION_TOTAL_STEPS,
+                meta={"attempt": attempt},
+            )
             generated_missions = await GPTService.generate_structured_missions(
                 mode="initial",
                 mission_count=3,
@@ -2728,16 +3589,39 @@ async def generate_initial_missions(
                 behavior_summary=behavior_summary,
             )
 
+            await emit_generation_progress(
+                progress,
+                generation_id=generation_id,
+                stage="validating_result",
+                label="서버 검수 중",
+                detail="미션 타입, A타입 허용 수치 밴드, 루틴/체크인 키, 금지 문구를 확인하고 있어요.",
+                progress_percent=84,
+                step_index=9,
+                total_steps=INITIAL_GENERATION_TOTAL_STEPS,
+                meta={"attempt": attempt},
+            )
+
             if not isinstance(generated_missions, list):
                 raise ValueError("GPT 초기 미션 응답이 리스트 형식이 아닙니다.")
 
             generated_missions = [
-                normalize_generated_mission(m)
+                ensure_mission_reason_for_validation(
+                    normalize_generated_mission(m),
+                    comparison=comparison,
+                    activity_summary=activity_summary,
+                    public_average=public_average,
+                    behavior_summary=behavior_summary,
+                )
                 for m in generated_missions
                 if isinstance(m, dict)
             ]
 
             validate_initial_missions(generated_missions)
+            for mission in generated_missions:
+                validate_a_type_uses_server_selected_target(
+                    mission,
+                    attempt_trace.get("personalization_policy"),
+                )
 
             original_missions_by_slot = {
                 m["slot_code"]: dict(m)
@@ -2750,9 +3634,15 @@ async def generate_initial_missions(
                 generated_missions,
                 activity_summary,
                 behavior_summary,
+                attempt_trace.get("personalization_policy"),
             )
 
             validate_initial_missions(generated_missions)
+            for mission in generated_missions:
+                validate_a_type_uses_server_selected_target(
+                    mission,
+                    attempt_trace.get("personalization_policy"),
+                )
             validate_initial_type_balance(generated_missions, activity_summary)
 
             generated_missions_with_meta: List[Dict[str, Any]] = []
@@ -2793,12 +3683,7 @@ async def generate_initial_missions(
                     validation_status="approved",
                     fallback_reason=fallback_reason,
                     input_summary={
-                        "user_profile": user_profile,
-                        "activity_summary": activity_summary,
-                        "comparison": comparison,
-                        "public_average": public_average,
-                        "health_gap": health_gap,
-                        "behavior_summary": behavior_summary,
+                        **base_input_summary,
                         "original_gpt_mission": original_mission,
                     },
                     output_mission=mission_with_meta,
@@ -2812,6 +3697,22 @@ async def generate_initial_missions(
         except Exception as e:
             last_generation_error = e
             raw_response_text = getattr(e, "raw_response_text", None)
+
+            await emit_generation_progress(
+                progress,
+                generation_id=generation_id,
+                stage="validation_retry" if attempt < 4 else "validation_failed",
+                label="검수 결과 재시도 준비 중" if attempt < 4 else "서버 fallback 준비 중",
+                detail=(
+                    "생성 결과가 서버 규칙과 맞지 않아 다시 생성하고 있어요."
+                    if attempt < 4
+                    else "반복 실패로 안전한 서버 fallback 미션을 준비하고 있어요."
+                ),
+                progress_percent=86 if attempt < 4 else 88,
+                step_index=9,
+                total_steps=INITIAL_GENERATION_TOTAL_STEPS,
+                meta={"attempt": attempt, "reason": str(e)},
+            )
 
             add_generation_log(
                 db,
@@ -2827,23 +3728,104 @@ async def generate_initial_missions(
                 validation_reason=str(e),
                 error_message=str(e),
                 raw_response_text=raw_response_text,
-                input_summary={
-                    "user_profile": user_profile,
-                    "activity_summary": activity_summary,
-                    "comparison": comparison,
-                    "public_average": public_average,
-                    "health_gap": health_gap,
-                    "behavior_summary": behavior_summary,
-                },
+                input_summary=base_input_summary,
                 output_mission=None,
             )
 
     if not missions:
-        raise HTTPException(
-            status_code=500,
-            detail=f"GPT 미션 생성 또는 초기 타입 균형 검수 실패: {str(last_generation_error)}"
+        await emit_generation_progress(
+            progress,
+            generation_id=generation_id,
+            stage="using_fallback",
+            label="안전 미션으로 보정 중",
+            detail="AI 결과가 반복해서 규칙에 맞지 않아 서버가 검수 가능한 기본 맞춤 미션을 만들고 있어요.",
+            progress_percent=90,
+            step_index=9,
+            total_steps=INITIAL_GENERATION_TOTAL_STEPS,
         )
+        fallback_reason = f"초기 GPT 미션 생성/검수 4회 실패 후 서버 fallback 사용: {str(last_generation_error)}"
+        fallback_trace = build_generation_trace_for_log(
+            mode="initial",
+            mission_count=3,
+            slot_codes=["A", "B", "C"],
+            user_profile=user_profile,
+            activity_summary=activity_summary,
+            comparison=comparison,
+            public_average=public_average,
+            health_gap=health_gap,
+            existing_missions=[],
+            previous_mission=None,
+            retry_attempt=4,
+            behavior_summary=behavior_summary,
+        )
+        fallback_input_summary = build_generation_input_summary(
+            user_profile=user_profile,
+            activity_summary=activity_summary,
+            comparison=comparison,
+            public_average=public_average,
+            health_gap=health_gap,
+            behavior_summary=behavior_summary,
+            generation_trace=fallback_trace,
+            existing_missions=[],
+            previous_mission=None,
+        )
+
+        fallback_policy = fallback_trace.get("personalization_policy") or {}
+        fallback_missions = [
+            build_initial_slot_fallback_mission("A", activity_summary, behavior_summary, fallback_policy),
+            build_initial_slot_fallback_mission("B", activity_summary, behavior_summary, fallback_policy),
+            build_initial_slot_fallback_mission("C", activity_summary, behavior_summary, fallback_policy),
+        ]
+
+        validate_initial_missions(fallback_missions)
+        for fallback_mission in fallback_missions:
+            validate_a_type_uses_server_selected_target(fallback_mission, fallback_policy)
+            validate_b3_routine_rotation(fallback_mission, fallback_policy)
+        validate_initial_type_balance(fallback_missions, activity_summary)
+
+        missions = []
+        for fallback_mission in fallback_missions:
+            slot_code = fallback_mission.get("slot_code")
+            mission_with_meta = attach_generation_meta(
+                fallback_mission,
+                provider="server_fallback",
+                attempt_count=4,
+                phase="fallback",
+                fallback_reason=fallback_reason,
+            )
+            add_generation_log(
+                db,
+                user_id=user.id,
+                mode="initial",
+                slot_code=slot_code,
+                requested_count=3,
+                phase="fallback",
+                attempt_no=0,
+                provider="server_fallback",
+                outcome="fallback_used",
+                mission_type=mission_with_meta.get("suggested_type"),
+                validation_status="approved",
+                fallback_reason=fallback_reason,
+                error_message=str(last_generation_error),
+                raw_response_text=getattr(last_generation_error, "raw_response_text", None),
+                input_summary=fallback_input_summary,
+                output_mission=mission_with_meta,
+                retry_count=4,
+                fallback_used=True,
+            )
+            missions.append(mission_with_meta)
     
+    await emit_generation_progress(
+        progress,
+        generation_id=generation_id,
+        stage="saving_missions",
+        label="DB 저장 중",
+        detail="검수된 미션과 생성 로그를 저장하고 게임 화면에 반영할 준비를 하고 있어요.",
+        progress_percent=94,
+        step_index=10,
+        total_steps=INITIAL_GENERATION_TOTAL_STEPS,
+    )
+
     # 7) DB 저장
     created_missions: List[UserMission] = []
 
@@ -2875,6 +3857,122 @@ async def generate_initial_missions(
         "profile_id": profile.id,
         "missions": [build_mission_response(mission) for mission in created_missions],
     }
+
+
+@router.post("/generate-initial")
+async def generate_initial_missions(
+    req: GenerateInitialMissionsRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    return await generate_initial_missions_core(req=req, db=db, user=user)
+
+
+@router.post("/generate-initial/stream")
+async def generate_initial_missions_stream(
+    req: GenerateInitialMissionsRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """최초 미션 생성 과정을 SSE(text/event-stream)로 전달한다."""
+
+    generation_id = f"initial-{user.id}-{int(datetime.utcnow().timestamp() * 1000)}"
+
+    async def event_generator():
+        queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue()
+
+        async def progress_callback(payload: Dict[str, Any]) -> None:
+            await queue.put(payload)
+
+        async def runner():
+            return await generate_initial_missions_core(
+                req=req,
+                db=db,
+                user=user,
+                progress=progress_callback,
+                generation_id=generation_id,
+            )
+
+        task = asyncio.create_task(runner())
+
+        yield format_sse_event(
+            "progress",
+            {
+                "generation_id": generation_id,
+                "status": "queued",
+                "stage": "queued",
+                "label": "미션 생성 준비 중",
+                "detail": "서버가 개인화 미션 생성 작업을 시작하고 있어요.",
+                "progress": 2,
+                "step_index": 0,
+                "total_steps": INITIAL_GENERATION_TOTAL_STEPS,
+            },
+        )
+
+        while True:
+            if task.done() and queue.empty():
+                break
+            try:
+                payload = await asyncio.wait_for(queue.get(), timeout=0.25)
+                yield format_sse_event("progress", payload)
+            except asyncio.TimeoutError:
+                yield ": keep-alive\n\n"
+
+        try:
+            result = await task
+            yield format_sse_event(
+                "complete",
+                {
+                    "generation_id": generation_id,
+                    "status": "completed",
+                    "stage": "completed",
+                    "label": "미션 생성 완료",
+                    "detail": "검수된 AI 미션이 게임 화면에 저장되었어요.",
+                    "progress": 100,
+                    "step_index": INITIAL_GENERATION_TOTAL_STEPS,
+                    "total_steps": INITIAL_GENERATION_TOTAL_STEPS,
+                    "result": result,
+                },
+            )
+        except HTTPException as e:
+            yield format_sse_event(
+                "error",
+                {
+                    "generation_id": generation_id,
+                    "status": "failed",
+                    "stage": "failed",
+                    "label": "미션 생성 실패",
+                    "detail": str(e.detail),
+                    "progress": 100,
+                    "error": str(e.detail),
+                    "status_code": e.status_code,
+                },
+            )
+        except Exception as e:
+            yield format_sse_event(
+                "error",
+                {
+                    "generation_id": generation_id,
+                    "status": "failed",
+                    "stage": "failed",
+                    "label": "미션 생성 실패",
+                    "detail": "미션 생성 중 오류가 발생했습니다.",
+                    "progress": 100,
+                    "error": str(e),
+                    "status_code": 500,
+                },
+            )
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
 
 @router.post("/start-slot")
 async def start_slot_mission(
@@ -2925,6 +4023,19 @@ async def start_slot_mission(
         )
 
     if target_mission.status == "in_progress":
+        log_mission_event(
+            db,
+            user_id=user.id,
+            mission=target_mission,
+            event_type=MISSION_EVENT_STARTED,
+            event_meta={
+                "source": "start_slot",
+                "already_in_progress": True,
+            },
+        )
+        db.commit()
+        db.refresh(target_mission)
+
         return {
             "ok": True,
             "message": f"{slot_code} 슬롯 미션이 이미 진행중입니다.",
@@ -2938,6 +4049,16 @@ async def start_slot_mission(
         target_mission.started_at = datetime.utcnow()
 
     db.add(target_mission)
+    log_mission_event(
+        db,
+        user_id=user.id,
+        mission=target_mission,
+        event_type=MISSION_EVENT_STARTED,
+        event_meta={
+            "source": "start_slot",
+            "already_in_progress": False,
+        },
+    )
     db.commit()
     db.refresh(target_mission)
 
@@ -2949,11 +4070,12 @@ async def start_slot_mission(
     }
 
 
-@router.post("/refresh-slot")
-async def refresh_slot_mission(
+async def refresh_slot_mission_core(
     req: RefreshSlotRequest,
-    db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    db: Session,
+    user: User,
+    progress: Optional[MissionProgressCallback] = None,
+    generation_id: Optional[str] = None,
 ):
     """
     특정 슬롯(A/B/C) 미션 1개 재생성
@@ -2968,6 +4090,17 @@ async def refresh_slot_mission(
             status_code=400,
             detail="slot_code는 A, B, C 중 하나여야 합니다."
         )
+
+    await emit_generation_progress(
+        progress,
+        generation_id=generation_id,
+        stage="checking_slot",
+        label=f"{slot_code} 슬롯 확인 중",
+        detail="재생성할 미션 슬롯과 요청 정보를 확인하고 있어요.",
+        progress_percent=10,
+        step_index=1,
+        total_steps=REFRESH_SLOT_TOTAL_STEPS,
+    )
 
     # 1) 헬스 데이터 확인
     latest_inbody = (
@@ -2990,6 +4123,17 @@ async def refresh_slot_mission(
         .first()
     )
 
+    await emit_generation_progress(
+        progress,
+        generation_id=generation_id,
+        stage="checking_health_data",
+        label="헬스 데이터 확인 중",
+        detail="인바디와 이번 주 활동 평균을 재생성 기준으로 사용할 수 있는지 확인하고 있어요.",
+        progress_percent=22,
+        step_index=2,
+        total_steps=REFRESH_SLOT_TOTAL_STEPS,
+    )
+
     # 2) 게임 프로필 확인
     profile = ensure_game_profile(db, user.id)
 
@@ -3001,6 +4145,17 @@ async def refresh_slot_mission(
         profile.daily_free_regen_remaining = 3
     if profile.mission_coins is None:
         profile.mission_coins = 0
+
+    await emit_generation_progress(
+        progress,
+        generation_id=generation_id,
+        stage="checking_regen_budget",
+        label="재생성 가능 횟수 확인 중",
+        detail="무료 재생성 횟수와 미션 쿠폰 사용 가능 여부를 확인하고 있어요.",
+        progress_percent=34,
+        step_index=3,
+        total_steps=REFRESH_SLOT_TOTAL_STEPS,
+    )
 
     # 3) 현재 슬롯의 active/in_progress 미션 찾기
     target_mission = (
@@ -3018,10 +4173,32 @@ async def refresh_slot_mission(
             detail=f"{slot_code} 슬롯의 활성 미션을 찾을 수 없습니다."
         )
 
+    await emit_generation_progress(
+        progress,
+        generation_id=generation_id,
+        stage="checking_current_mission",
+        label="기존 미션 확인 중",
+        detail="현재 미션과 직전 미션 정보를 비교해 중복을 피할 준비를 하고 있어요.",
+        progress_percent=46,
+        step_index=4,
+        total_steps=REFRESH_SLOT_TOTAL_STEPS,
+    )
+
     # 4) 재생성 비용 차감
     cost_result = consume_refresh_cost(
         profile=profile,
         use_mission_coin_if_needed=req.use_mission_coin_if_needed,
+    )
+
+    await emit_generation_progress(
+        progress,
+        generation_id=generation_id,
+        stage="consuming_regen_budget",
+        label="재생성 비용 처리 중",
+        detail="무료 재생성 또는 미션 쿠폰 사용 조건을 안전하게 반영하고 있어요.",
+        progress_percent=56,
+        step_index=5,
+        total_steps=REFRESH_SLOT_TOTAL_STEPS,
     )
 
     if not cost_result["ok"]:
@@ -3058,11 +4235,52 @@ async def refresh_slot_mission(
     activity_summary = build_activity_summary(latest_activity, recent_activities)
 
     public_average = await get_public_average_summary(db, latest_inbody, user)
-    health_gap = build_health_gap_summary(latest_inbody, latest_activity, public_average)
-    comparison = build_comparison_summary(latest_inbody, latest_activity, public_average)
-    behavior_summary = build_behavior_adaptation_summary(db, user.id)
+    health_gap = build_health_gap_summary(latest_inbody, latest_activity, public_average, activity_summary)
+    comparison = build_comparison_summary(
+        latest_inbody,
+        latest_activity,
+        public_average,
+        activity_summary,
+        health_gap,
+    )
+    pending_refresh_event = build_pending_event_history_item(
+        target_mission,
+        MISSION_EVENT_REFRESHED,
+        event_meta={
+            "source": "refresh_slot",
+            "cost_type": cost_result.get("cost_type"),
+        },
+    )
+    behavior_summary = get_behavior_summary_with_pending_event(
+        db,
+        user.id,
+        pending_event=pending_refresh_event,
+        recent_window_size=BEHAVIOR_HISTORY_WINDOW,
+    )
+
+    await emit_generation_progress(
+        progress,
+        generation_id=generation_id,
+        stage="building_personalization_context",
+        label="개인화 기준 계산 중",
+        detail="건강 요약, 행동 이력, B3 반복 차단, A타입 목표 수치를 다시 계산하고 있어요.",
+        progress_percent=68,
+        step_index=6,
+        total_steps=REFRESH_SLOT_TOTAL_STEPS,
+    )
 
     # 7) GPT 호출 + 3회 자동 재시도 + 직전 미션 동일성 차단
+    await emit_generation_progress(
+        progress,
+        generation_id=generation_id,
+        stage="generating_and_validating",
+        label="AI 미션 생성·검수 중",
+        detail="AI가 새 미션을 만들고, 서버가 수치·루틴·중복 규칙을 검수하고 있어요.",
+        progress_percent=80,
+        step_index=7,
+        total_steps=REFRESH_SLOT_TOTAL_STEPS,
+    )
+
     try:
         new_mission_data = await generate_single_slot_mission_with_fallback(
             mode="refresh",
@@ -3095,9 +4313,31 @@ async def refresh_slot_mission(
         }
     
 
+    await emit_generation_progress(
+        progress,
+        generation_id=generation_id,
+        stage="saving_new_mission",
+        label="새 미션 저장 중",
+        detail="검수된 미션을 DB에 저장하고 카드에 반영할 준비를 하고 있어요.",
+        progress_percent=92,
+        step_index=8,
+        total_steps=REFRESH_SLOT_TOTAL_STEPS,
+    )
+
     # 9) 기존 미션 refreshed 처리
     mark_slot_mission_refreshed(target_mission)
     db.add(target_mission)
+    log_mission_event(
+        db,
+        user_id=user.id,
+        mission=target_mission,
+        event_type=MISSION_EVENT_REFRESHED,
+        event_meta={
+            "source": "refresh_slot",
+            "cost_type": cost_result.get("cost_type"),
+            "next_mission_type": new_mission_data.get("suggested_type"),
+        },
+    )
 
     # 10) 새 미션 저장
     new_mission = create_mission_row(
@@ -3129,6 +4369,127 @@ async def refresh_slot_mission(
         "previous_mission_id": target_mission.id,
         "mission": build_mission_response(new_mission)
     }
+
+@router.post("/refresh-slot")
+async def refresh_slot_mission(
+    req: RefreshSlotRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    return await refresh_slot_mission_core(req=req, db=db, user=user)
+
+
+@router.post("/refresh-slot/stream")
+async def refresh_slot_mission_stream(
+    req: RefreshSlotRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """특정 슬롯 미션 재생성 과정을 SSE(text/event-stream)로 전달한다."""
+
+    slot_code = (req.slot_code or "").strip().upper()
+    generation_id = f"refresh-{slot_code or 'slot'}-{user.id}-{int(datetime.utcnow().timestamp() * 1000)}"
+
+    async def event_generator():
+        queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue()
+
+        async def progress_callback(payload: Dict[str, Any]) -> None:
+            await queue.put(payload)
+
+        async def runner():
+            return await refresh_slot_mission_core(
+                req=req,
+                db=db,
+                user=user,
+                progress=progress_callback,
+                generation_id=generation_id,
+            )
+
+        task = asyncio.create_task(runner())
+
+        yield format_sse_event(
+            "progress",
+            {
+                "generation_id": generation_id,
+                "status": "queued",
+                "stage": "queued",
+                "label": "미션 재생성 준비 중",
+                "detail": "업! 바디가 새 미션을 만들기 위해 서버 요청을 시작하고 있어요.",
+                "progress": 2,
+                "step_index": 0,
+                "total_steps": REFRESH_SLOT_TOTAL_STEPS,
+            },
+        )
+
+        while True:
+            if task.done() and queue.empty():
+                break
+            try:
+                payload = await asyncio.wait_for(queue.get(), timeout=0.25)
+                yield format_sse_event("progress", payload)
+            except asyncio.TimeoutError:
+                yield ": keep-alive\n\n"
+
+        try:
+            result = await task
+            ok = bool(result.get("ok")) if isinstance(result, dict) else True
+            yield format_sse_event(
+                "complete",
+                {
+                    "generation_id": generation_id,
+                    "status": "completed",
+                    "stage": "completed",
+                    "label": "미션 재생성 완료" if ok else "재생성 조건 확인 필요",
+                    "detail": (
+                        "새 미션이 카드에 반영될 준비를 마쳤어요."
+                        if ok
+                        else str(result.get("message") or "재생성 조건을 확인해주세요.")
+                    ),
+                    "progress": 100,
+                    "step_index": REFRESH_SLOT_TOTAL_STEPS,
+                    "total_steps": REFRESH_SLOT_TOTAL_STEPS,
+                    "result": result,
+                },
+            )
+        except HTTPException as e:
+            yield format_sse_event(
+                "error",
+                {
+                    "generation_id": generation_id,
+                    "status": "failed",
+                    "stage": "failed",
+                    "label": "미션 재생성 실패",
+                    "detail": str(e.detail),
+                    "progress": 100,
+                    "error": str(e.detail),
+                    "status_code": e.status_code,
+                },
+            )
+        except Exception as e:
+            yield format_sse_event(
+                "error",
+                {
+                    "generation_id": generation_id,
+                    "status": "failed",
+                    "stage": "failed",
+                    "label": "미션 재생성 실패",
+                    "detail": "미션 재생성 중 오류가 발생했습니다.",
+                    "progress": 100,
+                    "error": str(e),
+                    "status_code": 500,
+                },
+            )
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
 
 @router.post("/retry-slot")
 async def retry_slot_mission(
@@ -3248,8 +4609,14 @@ async def retry_slot_mission(
     activity_summary = build_activity_summary(latest_activity, recent_activities)
 
     public_average = await get_public_average_summary(db, latest_inbody, user)
-    health_gap = build_health_gap_summary(latest_inbody, latest_activity, public_average)
-    comparison = build_comparison_summary(latest_inbody, latest_activity, public_average)
+    health_gap = build_health_gap_summary(latest_inbody, latest_activity, public_average, activity_summary)
+    comparison = build_comparison_summary(
+        latest_inbody,
+        latest_activity,
+        public_average,
+        activity_summary,
+        health_gap,
+    )
     behavior_summary = build_behavior_adaptation_summary(db, user.id)
 
     # 6) GPT 호출 + 3회 자동 재시도 + 직전 미션 동일성 차단 / # 7) 검수
@@ -3392,6 +4759,7 @@ async def complete_slot_mission(
     # 6) 완료 처리 + 보상 지급
     target_mission.status = "completed"
     target_mission.is_completed = True
+    target_mission.completed_at = datetime.utcnow()
     target_mission.progress_json = evaluation["progress"]
 
     apply_mission_reward(db, profile, target_mission)
@@ -3399,6 +4767,19 @@ async def complete_slot_mission(
 
     db.add(profile)
     db.add(target_mission)
+    completed_event_meta = {
+        "source": "complete_slot",
+        "evaluation": evaluation,
+        "regenerate_after_complete": req.regenerate_after_complete,
+    }
+    log_mission_event(
+        db,
+        user_id=user.id,
+        mission=target_mission,
+        event_type=MISSION_EVENT_COMPLETED,
+        event_meta=completed_event_meta,
+    )
+    refresh_behavior_profile_snapshot(db, user.id)
 
     # 6-1) 성공 처리만: 보상만 지급하고 다음 미션은 생성하지 않음
     # 무료 재생성 횟수와 미션 쿠폰도 차감하지 않음
@@ -3517,9 +4898,25 @@ async def complete_slot_mission(
     activity_summary = build_activity_summary(latest_activity, recent_activities)
 
     public_average = await get_public_average_summary(db, latest_inbody, user)
-    health_gap = build_health_gap_summary(latest_inbody, latest_activity, public_average)
-    comparison = build_comparison_summary(latest_inbody, latest_activity, public_average)
-    behavior_summary = build_behavior_adaptation_summary(db, user.id)
+    health_gap = build_health_gap_summary(latest_inbody, latest_activity, public_average, activity_summary)
+    comparison = build_comparison_summary(
+        latest_inbody,
+        latest_activity,
+        public_average,
+        activity_summary,
+        health_gap,
+    )
+    pending_completed_event = build_pending_event_history_item(
+        target_mission,
+        MISSION_EVENT_COMPLETED,
+        event_meta=completed_event_meta,
+    )
+    behavior_summary = get_behavior_summary_with_pending_event(
+        db,
+        user.id,
+        pending_event=pending_completed_event,
+        recent_window_size=BEHAVIOR_HISTORY_WINDOW,
+    )
 
     # 8) GPT로 같은 슬롯 새 미션 생성 + 3회 자동 재시도 + 직전 미션 동일성 차단
     try:

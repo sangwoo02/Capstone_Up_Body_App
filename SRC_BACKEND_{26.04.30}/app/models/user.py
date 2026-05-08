@@ -127,6 +127,39 @@ class UserMission(Base):
     owner = relationship("User", back_populates="missions")
 
 
+class UserMissionEvent(Base):
+    """
+    사용자 미션 행동 이벤트 로그
+
+    started / completed / refreshed 같은 실제 사용자 행동을 별도로 저장한다.
+    이 테이블은 개인화 정책 엔진의 행동 이력 분석과 발표용 통계 산출에 사용된다.
+    """
+    __tablename__ = "user_mission_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False)
+    mission_id = Column(Integer, ForeignKey("user_missions.id", ondelete="SET NULL"), nullable=True, index=True)
+
+    event_type = Column(String, index=True, nullable=False)
+    # started / completed / refreshed
+
+    slot_code = Column(String, nullable=True, index=True)
+    mission_type = Column(String, nullable=True, index=True)
+    mission_status_after = Column(String, nullable=True)
+
+    params_json = Column(JSON, nullable=True)
+    progress_json = Column(JSON, nullable=True)
+    event_meta_json = Column(JSON, nullable=True)
+
+    reason = Column(Text, nullable=True)
+    generation_source = Column(String, nullable=True)
+    generation_provider = Column(String, nullable=True)
+    fallback_used = Column(Boolean, default=False, nullable=False)
+    consecutive_same_type_count = Column(Integer, default=1, nullable=False)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
 class UserActivity(Base):
     """웨어러블 기기에서 수집된 일일 활동 데이터"""
     __tablename__ = "user_activities"
@@ -193,7 +226,20 @@ class MissionGenerationLog(Base):
 
     fallback_reason = Column(Text, nullable=True)
     error_message = Column(Text, nullable=True)
-    
+
+    # 6차 고도화: PPT/실험 분석용 메타데이터
+    prompt_version = Column(String, nullable=True, index=True)
+    policy_version = Column(String, nullable=True, index=True)
+    contract_version = Column(String, nullable=True, index=True)
+    routine_catalog_version = Column(String, nullable=True)
+    experiment_variant = Column(String, nullable=True, index=True)
+    system_prompt_enabled = Column(Boolean, default=True, nullable=False)
+    retry_count = Column(Integer, default=0, nullable=False)
+    fallback_used = Column(Boolean, default=False, nullable=False, index=True)
+    validation_error_codes_json = Column(JSON, nullable=True)
+    policy_output_json = Column(JSON, nullable=True)
+    experiment_meta_json = Column(JSON, nullable=True)
+
     raw_response_text = Column(Text, nullable=True)
 
     input_summary_json = Column(JSON, nullable=True)
